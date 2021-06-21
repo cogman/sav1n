@@ -15,7 +15,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Build docker image
-      run: docker build . --file Dockerfile --tag cogman/sav1n:$(date +%s)
+      run: docker build . --file Dockerfile --tag cogman/sav1n:$(date +%s) cogman/sav1n:latest
     - name: Docker login
       env:
         DOCKER_USER: cogman
@@ -23,4 +23,4 @@ jobs:
       run: |
         docker login -u $DOCKER_USER -p $DOCKER_PASSWORD
     - name: Docker publish
-      run: docker push cogman/sav1n
+      run: docker push -a cogman/sav1n
