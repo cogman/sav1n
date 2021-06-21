@@ -14,5 +14,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-    - name: Build the Docker image
+    - name: Docker login
+      env:
+        DOCKER_USER: cogman
+        DOCKER_PASSWORD: ${{secrets.DOCKER_ACCESS_TOKEN}}
+      run: |
+        docker login -u $DOCKER_USER -p $DOCKER_PASSWORD
+    - name: Build docker image
       run: docker build . --file Dockerfile --tag sav1n:$(date +%s)
+    - name: Docker publish
+      run: docker push cogman/sav1n
