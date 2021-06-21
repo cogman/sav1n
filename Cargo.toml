@@ -1,0 +1,14 @@
+[package]
+name = "sav1n"
+version = "0.1.0"
+authors = ["cogma"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version="1.7.0", features=["io-std", "fs", "io-util", "time", "process", "macros", "rt-multi-thread", "sync"] }
+clap = "3.0.0-beta.2"
+
+[profile.release]
+opt-level = 3
