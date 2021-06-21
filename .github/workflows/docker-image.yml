@@ -15,7 +15,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Build docker image
-      run: docker build . --file Dockerfile --tag sav1n:$(date +%s)
+      run: docker build . --file Dockerfile --tag cogman/sav1n:$(date +%s)
     - name: Docker login
       env:
         DOCKER_USER: cogman
