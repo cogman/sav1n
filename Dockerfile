@@ -1,4 +1,5 @@
 FROM debian:bullseye-slim AS runtime
+
 ARG CFLAGS="-fno-omit-frame-pointer -pthread -fgraphite-identity -floop-block -ldl -lpthread -g -fPIC"
 ARG CXXFLAGS="-fno-omit-frame-pointer -pthread -fgraphite-identity -floop-block -ldl -lpthread -g -fPIC"
 ARG LDFLAGS="-Wl,-Bsymbolic -fPIC"
