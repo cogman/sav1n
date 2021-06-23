@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y \
 FROM rust:slim-bullseye AS rustBuild
 
 WORKDIR /sav1n
-COPY . .
+COPY src/ src/
+COPY Cargo.toml .
+COPY Cargo.lock .
 ENV RUSTFLAGS "-Zsanitizer=address"
 ENV RUSTDOCFLAGS "-Zsanitizer=address"
 RUN rustup install nightly
@@ -27,14 +29,18 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     build-essential \
+    cmake \
     git \
     libtool \
+    perl \
     pkg-config \
     python3-pip \
+    yasm \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 --no-cache-dir install meson setuptools cython sphinx
 
+FROM build AS vapoursynth
 RUN mkdir -p /vapoursynth/dependencies && git clone https://github.com/sekrit-twc/zimg -b master --depth=1 /vapoursynth/dependencies/zimg
 WORKDIR /vapoursynth/dependencies/zimg
 RUN ./autogen.sh  && \
@@ -49,11 +55,23 @@ RUN ./autogen.sh && \
     make -j"$(nproc)" && \
     make install
 
+FROM build AS aom
+RUN git clone https://aomedia.googlesource.com/aom /aom
+WORKDIR /aom_build
+RUN cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release /aom && \
+    make -j"$(nproc)" && \
+    make install
+
 FROM runtime
 WORKDIR /sav1n
 
-COPY --from=build /usr/local/lib /usr/local/lib
-COPY --from=build /usr/local/bin /usr/local/bin
+COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib
+COPY --from=vapoursynth /usr/local/lib/*.la* /usr/local/lib
+COPY --from=vapoursynth /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
+COPY --from=vapoursynth /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin
+COPY --from=aom /usr/local/bin/aomenc /usr/local/bin
+
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
