@@ -21,6 +21,7 @@ jobs:
     - name: Run tests
       run: |
         sudo apt-get install -y libcurl4-openssl-dev libelf-dev libdw-dev cmake gcc g++ binutils-dev libiberty-dev;
+        export CARGO_INCREMENTAL=0;
         cargo test --verbose;
         bash run_code_coverage.sh;
     - name: Upload coverage
