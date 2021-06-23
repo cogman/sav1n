@@ -65,8 +65,8 @@ RUN cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release /aom && \
 FROM runtime
 WORKDIR /sav1n
 
-COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib
-COPY --from=vapoursynth /usr/local/lib/*.la* /usr/local/lib
+COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib/
+COPY --from=vapoursynth /usr/local/lib/*.la* /usr/local/lib/
 COPY --from=vapoursynth /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=vapoursynth /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin
