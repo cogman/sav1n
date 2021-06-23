@@ -8,27 +8,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 FROM rust:slim-bullseye AS rustBuild
-
-RUN apt-get update && apt-get install -y \
-    binutils-dev \
-    cmake \
-    curl \
-    gcc \
-    g++ \
-    libcurl4-openssl-dev \
-    libssl-dev \
-    libdw-dev \
-    libelf-dev \
-    libiberty-dev \
-    python3 \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /sav1n
 
 COPY src/ src/
 COPY Cargo.toml .
 COPY Cargo.lock .
+ENV RUSTFLAGS "-Zsanitizer=address"
+ENV RUSTDOCFLAGS "-Zsanitizer=address"
+RUN rustup install nightly
+RUN rustup toolchain install nightly --component rust-src
+RUN cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+
 ENV RUSTFLAGS "-C target-cpu=znver1"
 RUN cargo build --release
 
