@@ -1,3 +1,7 @@
+[![codecov](https://codecov.io/gh/cogman/sav1n/branch/main/graph/badge.svg?token=GGPZGZQPO3)](https://codecov.io/gh/cogman/sav1n)
+![rust build](https://github.com/cogman/sav1n/actions/workflows/rust.yml/badge.svg)
+![docker build](https://github.com/cogman/sav1n/actions/workflows/docker-image.yml/badge.svg)
+
 # Sav1n
 
 A progressive Vapoursynth encoding system.
