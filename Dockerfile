@@ -10,6 +10,18 @@ RUN apt-get update && apt-get install -y \
     libpython3.9 \
     && rm -rf /var/lib/apt/lists/*
 
+FROM rust:slim-bullseye AS rustBuild
+
+WORKDIR /sav1n
+COPY . .
+ENV RUSTFLAGS "-Zsanitizer=address"
+ENV RUSTDOCFLAGS "-Zsanitizer=address"
+RUN rustup install nightly
+RUN rustup toolchain install nightly --component rust-src
+RUN cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+ENV RUSTFLAGS "-C target-cpu=znver1"
+RUN cargo build --release
+
 FROM runtime AS build
 RUN apt-get update && apt-get install -y \
     autoconf \
@@ -36,13 +48,6 @@ RUN ./autogen.sh && \
     ./configure --enable-shared && \
     make -j"$(nproc)" && \
     make install
-
-FROM rust:slim-bullseye AS rustBuild
-
-WORKDIR /sav1n
-COPY . .
-ENV RUSTFLAGS "-C target-cpu=znver1"
-RUN cargo build --release
 
 FROM runtime
 WORKDIR /sav1n
