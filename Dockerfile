@@ -1,8 +1,5 @@
 FROM debian:bullseye-slim AS runtime
 
-ARG CFLAGS="-fno-omit-frame-pointer -pthread -fgraphite-identity -floop-block -ldl -lpthread -g -fPIC"
-ARG CXXFLAGS="-fno-omit-frame-pointer -pthread -fgraphite-identity -floop-block -ldl -lpthread -g -fPIC"
-ARG LDFLAGS="-Wl,-Bsymbolic -fPIC"
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu/:/usr/local/lib/vapoursynth
 
 RUN apt-get update && apt-get install -y \
@@ -12,15 +9,35 @@ RUN apt-get update && apt-get install -y \
 
 FROM rust:slim-bullseye AS rustBuild
 
+RUN apt-get update && apt-get install -y \
+    binutils-dev \
+    cmake \
+    gcc \
+    g++ \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libdw-dev \
+    libelf-dev \
+    libiberty-dev \
+    python3 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /sav1n
+
 COPY src/ src/
 COPY Cargo.toml .
 COPY Cargo.lock .
+COPY run_code_coverage.sh .
 ENV RUSTFLAGS "-Zsanitizer=address"
 ENV RUSTDOCFLAGS "-Zsanitizer=address"
 RUN rustup install nightly
 RUN rustup toolchain install nightly --component rust-src
 RUN cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+
+ENV CODECOV_TOKEN=$CODECOV_TOKEN
+RUN bash run_code_coverage.sh
+ENV CODECOV_TOKEN=""
 ENV RUSTFLAGS "-C target-cpu=znver1"
 RUN cargo build --release
 
@@ -41,6 +58,8 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 --no-cache-dir install meson setuptools cython sphinx
 
 FROM build AS vapoursynth
+ARG CFLAGS="-O3 -march=znver1 -flto -fPIC -s"
+ARG CXXFLAGS="-O3 -march=znver1 -flto -fPIC -s"
 RUN mkdir -p /vapoursynth/dependencies && git clone https://github.com/sekrit-twc/zimg -b master --depth=1 /vapoursynth/dependencies/zimg
 WORKDIR /vapoursynth/dependencies/zimg
 RUN ./autogen.sh  && \
@@ -56,9 +75,11 @@ RUN ./autogen.sh && \
     make install
 
 FROM build AS aom
+ARG CFLAGS="-O3 -march=znver1 -flto -fPIC -s"
+ARG CXXFLAGS="-O3 -march=znver1 -flto -fPIC -s"
 RUN git clone https://aomedia.googlesource.com/aom /aom
 WORKDIR /aom_build
-RUN cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_BUILD_TYPE=Release /aom && \
+RUN cmake -DBUILD_SHARED_LIBS=1 -DCMAKE_BUILD_TYPE=Release /aom && \
     make -j"$(nproc)" && \
     make install
 
@@ -70,7 +91,10 @@ COPY --from=vapoursynth /usr/local/lib/*.la* /usr/local/lib/
 COPY --from=vapoursynth /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=vapoursynth /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin
+
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin
+COPY --from=aom /usr/local/lib/*.so* /usr/local/lib/
+COPY --from=aom /usr/local/lib/*.la* /usr/local/lib/
 
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 

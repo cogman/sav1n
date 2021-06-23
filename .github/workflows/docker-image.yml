@@ -15,7 +15,9 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Build docker image
-      run: docker build . --file Dockerfile -t cogman/sav1n:$(date +%s) -t cogman/sav1n:latest
+      env:
+        CODECOV_TOKEN: ${{secrets.CODECOV_TOKEN}}
+      run: docker build . --build-arg CODECOV_TOKEN=${CODECOV_TOKEN} --file Dockerfile -t cogman/sav1n:$(date +%s) -t cogman/sav1n:latest
     - name: Docker login
       env:
         DOCKER_USER: cogman
