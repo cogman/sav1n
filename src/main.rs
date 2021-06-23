@@ -65,11 +65,11 @@ async fn main() {
         let buffer = FrameBuffer::new(1, header.clone());
         header.write(&mut writer).await;
 
-        let mut status = Processing;
+        let mut status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         while status == Processing {
-            status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
             let frame = buffer.pop().await;
             frame.unwrap().write(&mut writer).await;
+            status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         }
     }
 }
