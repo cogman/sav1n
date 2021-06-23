@@ -22,7 +22,7 @@ jobs:
       run: |
         sudo apt-get install -y libcurl4-openssl-dev libelf-dev libdw-dev cmake gcc g++ binutils-dev libiberty-dev;
         export CARGO_INCREMENTAL=0;
-        cargo test --verbose;
+        cargo test --verbose --no-run;
         bash run_code_coverage.sh;
     - name: Upload coverage
       uses: codecov/codecov-action@v1
