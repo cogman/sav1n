@@ -14,7 +14,7 @@ use tokio::io::{BufReader, AsyncBufReadExt, BufWriter, AsyncWriteExt};
 use crate::frame::frame::Status::Processing;
 use clap::{App, Arg};
 use std::mem::size_of;
-use crate::aom_firstpass::AOM_firstpass;
+use crate::aom_firstpass::AomFirstpass;
 
 #[tokio::main]
 async fn main() {
@@ -51,7 +51,7 @@ async fn main() {
 
         let mut vs_pipe_reader = BufReader::with_capacity(1024, vspipe_output);
         let mut keyframe_log = tokio::fs::File::open("keyframe.log").await.unwrap();
-        let mut keyframe_reader = BufReader::with_capacity(size_of::<AOM_firstpass>(), keyframe_log);
+        let mut keyframe_reader = BufReader::with_capacity(size_of::<AomFirstpass>(), keyframe_log);
         let mut writer = BufWriter::with_capacity(1024, aom_input);
 
         tokio::spawn(async move {

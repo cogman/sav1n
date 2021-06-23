@@ -1,5 +1,5 @@
 #[repr(C)]
-pub struct AOM_firstpass {
+pub struct AomFirstpass {
     frame: f64,
     weight: f64,
     intra_error: f64,
