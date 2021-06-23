@@ -12,6 +12,7 @@ FROM rust:slim-bullseye AS rustBuild
 RUN apt-get update && apt-get install -y \
     binutils-dev \
     cmake \
+    curl \
     gcc \
     g++ \
     libcurl4-openssl-dev \
