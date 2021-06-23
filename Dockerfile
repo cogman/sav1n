@@ -75,7 +75,6 @@ COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin
 
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin
 COPY --from=aom /usr/local/lib/*.so* /usr/local/lib/
-COPY --from=aom /usr/local/lib/*.la* /usr/local/lib/
 
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
