@@ -29,16 +29,6 @@ WORKDIR /sav1n
 COPY src/ src/
 COPY Cargo.toml .
 COPY Cargo.lock .
-COPY run_code_coverage.sh .
-ENV RUSTFLAGS "-Zsanitizer=address"
-ENV RUSTDOCFLAGS "-Zsanitizer=address"
-RUN rustup install nightly
-RUN rustup toolchain install nightly --component rust-src
-RUN cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
-
-ENV CODECOV_TOKEN=$CODECOV_TOKEN
-RUN bash run_code_coverage.sh
-ENV CODECOV_TOKEN=""
 ENV RUSTFLAGS "-C target-cpu=znver1"
 RUN cargo build --release
 
