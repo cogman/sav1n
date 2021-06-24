@@ -9,6 +9,7 @@ pub mod frame_buffer {
     use std::cell::UnsafeCell;
 
     pub struct FrameBufferData {
+        finished: bool,
         frame_number: u64,
         head: usize,
         tail: usize,
@@ -42,6 +43,7 @@ pub mod frame_buffer {
             }
 
             let buffer = FrameBufferData {
+                finished: false,
                 frame_number: 0,
                 head: 0,
                 tail: 0,
@@ -90,26 +92,45 @@ pub mod frame_buffer {
             self.std_mutex.add_permits(1);
         }
 
-        pub async fn get_frame(&self, frame_num: u64) -> &'a Frame {
+        pub async fn get_frame(&self, frame_num: u64) -> Option<&'a Frame> {
             let mut permit = self.std_mutex.acquire().await.unwrap();
-            let mut next_frame = unsafe { (*self.ptr()).frame_number };
-            let mut earliest_frame =
-                if self.frames_len as u64 > frame_num { 0 } else { next_frame - (self.frames_len - 1) as u64 };
 
-            if frame_num < earliest_frame {
-                panic!("Frame {} is already out of the buffer!", frame_num);
-            }
-            while frame_num >= next_frame {
+            while frame_num >= unsafe {(*self.ptr()).frame_number} {
+                if unsafe {(*self.ptr()).finished} {
+                    return None
+                }
                 permit.forget();
                 self.std_mutex.add_permits(1);
                 self.wait_for_frame.notified().await;
                 permit = self.std_mutex.acquire().await.unwrap();
-                unsafe { next_frame = (*self.ptr()).frame_number; }
             }
-
-            earliest_frame =
-                if self.frames_len as u64 > frame_num { 0 } else { next_frame - (self.frames_len - 1) as u64 };
-            return self.frame_index((frame_num - earliest_frame) as usize);
+            let mut tail = unsafe { (*self.ptr()).tail };
+            if tail == 0 {
+                tail = self.frames_len - 1;
+            }
+            else {
+                tail -= 1;
+            }
+            let mut tail_num = self.frame_index(tail).num;
+            let head = unsafe { (*self.ptr()).head };
+            let head_num = self.frame_index(head).num;
+            if frame_num < head_num {
+                panic!("Frame fell out of buffer! asked for {}, earliest frame is {}", frame_num, head_num)
+            }
+            let offset = tail_num - frame_num;
+            let mut index: u64;
+            if offset > tail as u64 {
+                let leftover = offset - tail as u64;
+                index = self.frames_len as u64 - leftover;
+            }
+            else {
+                index = tail as u64 - offset;
+            }
+            let frame = self.frame_index(index as usize);
+            if frame.num != frame_num {
+                panic!("Returned the wrong frame! Returned {} asked for {}", frame.num, frame_num);
+            }
+            return Some(frame);
         }
 
         async fn reserve_frame(&self) -> &'a mut Frame {
@@ -134,10 +155,24 @@ pub mod frame_buffer {
         }
 
         pub async fn read_in_frame(&self, reader: &mut (impl AsyncBufReadExt + Unpin)) -> io::Result<Status> {
-            let frame = self.reserve_frame().await;
+            let frame = self.reserve_frame().await; // Holds onto the std_mutex
             let status = frame.read(frame.data_len, frame.num, reader).await?;
+            if status == Status::Completed { // Rewind the tail
+                unsafe {
+                    let mut ptr = self.ptr();
+                    (*ptr).finished = true;
+                    (*ptr).size -= 1;
+                    if (*ptr).tail > 0 {
+                        (*ptr).tail -= 1;
+                    }
+                    else {
+                        (*ptr).tail = self.frames_len - 1;
+                    }
+                    (*ptr).frame_number -= 1;
+                }
+            }
             self.wait_for_frame.notify_waiters();
-            self.std_mutex.add_permits(1);
+            self.std_mutex.add_permits(1); // Released because reserve_frame forgets std_mutex
             return Ok(status);
         }
 
@@ -190,7 +225,7 @@ pub mod frame_buffer {
 #[cfg(test)]
 mod tests {
     use crate::frame_buffer::frame_buffer::FrameBuffer;
-    use crate::frame::frame::Frame;
+    use crate::frame::frame::{Frame, Status};
     use crate::video_header::{VideoHeader, ColorSpaceType};
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -260,7 +295,7 @@ mod tests {
     async fn specific_frame_test_present() {
         let buffer = FrameBuffer::new(2, VideoHeader::new());
         buffer.add_frame(&Frame::new(10, 0)).await;
-        let frame = buffer.get_frame(0).await;
+        let frame = buffer.get_frame(0).await.unwrap();
         assert_eq!(frame.num, 0)
     }
 
@@ -270,7 +305,7 @@ mod tests {
 
         let clone1 = buffer.clone();
         let frame = tokio::spawn(async move {
-            return clone1.get_frame(0).await;
+            return clone1.get_frame(0).await.unwrap();
         });
         let clone2 = buffer.clone();
         tokio::spawn(async move {
@@ -285,7 +320,7 @@ mod tests {
         let buffer = FrameBuffer::new(2, VideoHeader::new());
         buffer.add_frame(&Frame::new(10, 0)).await;
         buffer.add_frame(&Frame::new(10, 1)).await;
-        let frame = buffer.get_frame(1).await;
+        let frame = buffer.get_frame(1).await.unwrap();
         assert_eq!(frame.num, 1)
     }
 
@@ -303,10 +338,12 @@ mod tests {
         let mut data: Vec<u8> = vec!();
         data.extend(b"FRAME\x0AwhatFRAME\x0Alove");
         let mut test_file = Cursor::new(data);
-        buffer.read_in_frame(&mut test_file).await.unwrap();
-        buffer.read_in_frame(&mut test_file).await.unwrap();
-        let frame0 = buffer.get_frame(0).await;
-        let frame1 = buffer.get_frame(1).await;
+        let status0 = buffer.read_in_frame(&mut test_file).await.unwrap();
+        let status1 = buffer.read_in_frame(&mut test_file).await.unwrap();
+        assert_eq!(status0, Status::Processing);
+        assert_eq!(status1, Status::Processing);
+        let frame0 = buffer.get_frame(0).await.unwrap();
+        let frame1 = buffer.get_frame(1).await.unwrap();
         assert_eq!(frame0.data(), b"what");
         assert_eq!(frame1.data(), b"love");
     }

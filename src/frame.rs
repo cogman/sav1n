@@ -3,7 +3,7 @@ pub mod frame {
     use tokio::io;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-    #[derive(PartialEq)]
+    #[derive(PartialEq, Debug)]
     pub enum Status {
         Completed,
         Processing
