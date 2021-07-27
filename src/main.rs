@@ -15,7 +15,6 @@ use tokio::io::{BufReader, AsyncBufReadExt, BufWriter, AsyncWriteExt};
 use crate::frame::frame::Status::Processing;
 use clap::{App, Arg};
 use std::mem::size_of;
-use crate::aom_firstpass::AomFirstpass;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
