@@ -1,6 +1,7 @@
 pub mod aom {
     use tokio::io::{AsyncRead, AsyncReadExt, Error};
     use core::mem;
+    use std::ops::Div;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -162,7 +163,7 @@ pub mod aom {
             };
         }
 
-        pub async fn readAomFirstpass(reader: &mut (impl AsyncRead + Unpin)) -> Result<AomFirstpass, Error> {
+        pub async fn read_aom_firstpass(reader: &mut (impl AsyncRead + Unpin)) -> Result<AomFirstpass, Error> {
             let mut firstpass = AomFirstpass::empty();
             unsafe {
                 let buffer: &mut [u8] = std::slice::from_raw_parts_mut(
@@ -172,6 +173,112 @@ pub mod aom {
                 reader.read_exact(buffer).await?;
             }
             return Ok(firstpass);
+        }
+
+        fn get_second_ref_usage_thresh(frame_count_so_far: u64) -> f64 {
+            let adapt_upto = 32;
+            let min_second_ref_usage_thresh = 0.085;
+            let second_ref_usage_thresh_max_delta = 0.035;
+            return if frame_count_so_far >= adapt_upto {
+                min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
+            } else {
+                min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1)) as f64 * second_ref_usage_thresh_max_delta
+            };
+        }
+
+        const VERY_LOW_INTER_THRESH: f64 = 0.05;
+        const MIN_INTRA_LEVEL: f64 = 0.25;
+        const INTRA_VS_INTER_THRESH: f64 = 2.0;
+        const KF_II_ERR_THRESHOLD: f64 = 1.9;
+        const ERR_CHANGE_THRESHOLD: f64 = 0.4;
+        const II_IMPROVEMENT_THRESHOLD: f64 = 3.5;
+        const BOOST_FACTOR: f64 = 12.5;
+        const KF_II_MAX: f64 = 128.0;
+
+        pub fn test_candidate_kf(self, last_frame: AomFirstpass, next_frame: AomFirstpass, future_frames: &[AomFirstpass; 16], frame_count_so_far: u64) -> bool {
+            let mut is_viable_kf = false;
+            let pcnt_intra = 1.0 - self.pcnt_neutral;
+            let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
+            let second_ref_usage_thresh = Self::get_second_ref_usage_thresh(frame_count_so_far);
+            let total_frames_to_test = 16;
+            let count_for_tolerable_prediction = 3;
+
+            if frame_count_so_far >= 3
+                && (self.pcnt_second_ref < second_ref_usage_thresh) &&
+                (next_frame.pcnt_second_ref < second_ref_usage_thresh) &&
+                ((self.pcnt_inter < Self::VERY_LOW_INTER_THRESH) ||
+                    self.slide_transition(last_frame, next_frame) ||
+                    ((pcnt_intra > Self::MIN_INTRA_LEVEL) &&
+                        (pcnt_intra > (Self::INTRA_VS_INTER_THRESH * modified_pcnt_inter)) &&
+                        ((self.intra_error /
+                            Self::double_divide_check(self.coded_error)) <
+                            Self::KF_II_ERR_THRESHOLD) &&
+                        (((last_frame.coded_error - self.coded_error).abs() /
+                            Self::double_divide_check(self.coded_error) >
+                            Self::ERR_CHANGE_THRESHOLD) ||
+                            ((last_frame.intra_error - self.intra_error).abs() /
+                                Self::double_divide_check(self.intra_error) >
+                                Self::ERR_CHANGE_THRESHOLD) ||
+                            ((next_frame.intra_error /
+                                Self::double_divide_check(next_frame.coded_error)) >
+                                Self::II_IMPROVEMENT_THRESHOLD)))) {
+                let mut boost_score = 0.0;
+                let mut old_boost_score = 0.0;
+                let mut decay_accumulator = 1.0;
+                let mut j = 0;
+                for i in 0 .. total_frames_to_test {
+                    j = i;
+                    let local_next_frame = future_frames[i];
+                    let mut next_iiratio = (Self::BOOST_FACTOR * local_next_frame.intra_error /
+                        Self::double_divide_check(local_next_frame.coded_error));
+
+                    if next_iiratio > Self::KF_II_MAX {
+                        next_iiratio = Self::KF_II_MAX;
+                    }
+
+                    if local_next_frame.pcnt_inter > 0.85 {
+                        decay_accumulator *= local_next_frame.pcnt_inter;
+                    }
+                    else {
+                        decay_accumulator *= (0.85 + local_next_frame.pcnt_inter) / 2.0;
+                    }
+
+                    boost_score += (decay_accumulator * next_iiratio);
+
+                    if (local_next_frame.pcnt_inter < 0.05) || (next_iiratio < 1.5) ||
+                        (((local_next_frame.pcnt_inter - local_next_frame.pcnt_neutral) <
+                            0.20) &&
+                            (next_iiratio < 3.0)) ||
+                        ((boost_score - old_boost_score) < 3.0) ||
+                        (local_next_frame.intra_error < (200.0)) {
+                    break;
+                    }
+                    old_boost_score = boost_score;
+                }
+                if boost_score > 30.0 && (j > count_for_tolerable_prediction) {
+                    is_viable_kf = true;
+                } else {
+                    is_viable_kf = false;
+                }
+            }
+
+            return is_viable_kf;
+        }
+
+        const VERY_LOW_II: f64 = 1.5;
+        const ERROR_SPIKE: f64 = 5.0;
+        fn slide_transition(self, last_frame: AomFirstpass, next_frame: AomFirstpass) -> bool {
+            return (self.intra_error < (self.coded_error * Self::VERY_LOW_II))
+                && (self.coded_error > (last_frame.coded_error * Self::ERROR_SPIKE))
+                && (self.coded_error > (next_frame.coded_error * Self::ERROR_SPIKE));
+        }
+
+        fn double_divide_check(x: f64) -> f64 {
+            return if x < 0.0 {
+                x - 0.000001
+            } else {
+                x + 0.000001
+            };
         }
     }
 }
@@ -189,8 +296,8 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&RAW_FRAME_DATA);
         let mut test_file = Cursor::new(data);
-        let frame1 = AomFirstpass::readAomFirstpass(&mut test_file).await.unwrap();
-        let frame2 = AomFirstpass::readAomFirstpass(&mut test_file).await.unwrap();
+        let frame1 = AomFirstpass::read_aom_firstpass(&mut test_file).await.unwrap();
+        let frame2 = AomFirstpass::read_aom_firstpass(&mut test_file).await.unwrap();
 
         assert_eq!(0.0, frame1.frame);
         assert_eq!(1.0, frame2.frame);
