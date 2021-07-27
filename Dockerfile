@@ -129,8 +129,7 @@ COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
 WORKDIR /ffmpeg
-RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.tar.bz2 && \
-    tar xjvf ffmpeg-snapshot.tar.bz2 && \
+RUN git clone --branch 'release/4.4' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
     ./configure \
       --disable-doc \
@@ -149,6 +148,26 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
     make -j`nproc` && \
     make install
 
+FROM ffmpeg AS ffms2
+RUN git clone https://github.com/FFMS/ffms2.git --depth 1 /ffms2 && mkdir -p /ffms2/src/config
+WORKDIR /ffms2/
+RUN autoreconf -fiv && \
+    ./configure --enable-shared  && \
+    make
+
+FROM ffmpeg AS lsmash
+RUN git clone https://github.com/l-smash/l-smash --depth 1 /lsmash
+WORKDIR /lsmash
+RUN ./configure --enable-shared && \
+    make && \
+    make install
+
+RUN git clone https://github.com/HolyWu/L-SMASH-Works.git --depth 1 /lsmash-plugin && mkdir -p /lsmash-plugin/build-vapoursynth /lsmash-plugin/build-avisynth
+WORKDIR /lsmash-plugin/build-vapoursynth
+RUN meson "../VapourSynth" && \
+    ninja && \
+    ninja install
+
 FROM runtime
 WORKDIR /sav1n
 
@@ -162,7 +181,11 @@ COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin
 COPY --from=vmaf /usr/local/share /usr/local/share
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin
-COPY --from=ffmpeg /usr/local/lib/*.so* /usr/local/lib/
+COPY --from=ffmpeg /usr/local/lib/*.so* /usr/local/lib/lsmash
+COPY --from=ffms2 /usr/local/lib/*.so* /usr/local/lib/lsmash
+COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/vapoursynth/
+COPY --from=lsmash /usr/local/lib/*.so* /usr/local/lib/
+COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
