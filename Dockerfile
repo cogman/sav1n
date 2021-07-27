@@ -4,21 +4,7 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-
 
 RUN apt-get update && apt-get install -y \
     python3 \
-    libass9 \
-    libfreetype6 \
-    libgnutls30  \
-    libgnutlsxx28 \
-    libgnutls-openssl27 \
-    libgnutls-dane0 \
     libpython3.9 \
-    libsdl2-2.0-0 \
-    libva2  \
-    libvdpau1 \
-    libxcb1 \
-    libxcb-shm0 \
-    libxcb-xfixes0 \
-    texinfo \
-    zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 FROM rust:slim-bullseye AS rustBuild
