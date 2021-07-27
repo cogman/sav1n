@@ -133,6 +133,9 @@ RUN git clone --branch 'release/4.4' https://github.com/FFmpeg/FFmpeg.git --dept
     cd ffmpeg && \
     ./configure \
       --disable-doc \
+      --disable-static \
+      --enable-shared \
+      --enable-pic \
       --extra-libs="-lpthread -lm" \
       --ld="g++" \
       --enable-gpl \
