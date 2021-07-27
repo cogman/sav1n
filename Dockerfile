@@ -37,8 +37,8 @@ ENV RUSTFLAGS "-C target-cpu=znver1"
 RUN cargo build --release
 
 FROM runtime AS build
-ARG CFLAGS="-O3 -march=znver1 -flto -fPIC -s"
-ARG CXXFLAGS="-O3 -march=znver1 -flto -fPIC -s"
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
@@ -70,8 +70,8 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 --no-cache-dir install meson setuptools cython sphinx
 
 FROM build AS vapoursynth
-ARG CFLAGS="-O3 -march=znver1 -flto -fPIC -s"
-ARG CXXFLAGS="-O3 -march=znver1 -flto -fPIC -s"
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 RUN mkdir -p /vapoursynth/dependencies && git clone https://github.com/sekrit-twc/zimg -b master --depth=1 /vapoursynth/dependencies/zimg
 WORKDIR /vapoursynth/dependencies/zimg
 RUN ./autogen.sh  && \
@@ -80,6 +80,8 @@ RUN ./autogen.sh  && \
     make install
 
 RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b master /vapoursynth/build
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -87,8 +89,8 @@ RUN ./autogen.sh && \
     make install
 
 FROM build AS aom
-ARG CFLAGS="-O3 -march=znver1 -flto -fPIC -s"
-ARG CXXFLAGS="-O3 -march=znver1 -flto -fPIC -s"
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b master /aom
 WORKDIR /aom_build
 RUN cmake -DBUILD_SHARED_LIBS=1 -DCMAKE_BUILD_TYPE=Release /aom && \
@@ -96,6 +98,8 @@ RUN cmake -DBUILD_SHARED_LIBS=1 -DCMAKE_BUILD_TYPE=Release /aom && \
     make install
 
 FROM build AS dav1d
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 WORKDIR /dav1d
 RUN git -C dav1d pull 2> /dev/null || git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && \
     mkdir -p dav1d/build && \
@@ -105,6 +109,8 @@ RUN git -C dav1d pull 2> /dev/null || git clone --depth 1 https://code.videolan.
     ninja install
 
 FROM build AS opus
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 WORKDIR /opus
 RUN git -C opus pull 2> /dev/null || git clone --depth 1 https://github.com/xiph/opus.git && \
     cd opus && \
@@ -114,6 +120,8 @@ RUN git -C opus pull 2> /dev/null || git clone --depth 1 https://github.com/xiph
     make install
 
 FROM build AS vmaf
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 WORKDIR /vmaf
 RUN wget https://github.com/Netflix/vmaf/archive/v2.1.1.tar.gz && \
     tar xvf v2.1.1.tar.gz && \
@@ -124,6 +132,8 @@ RUN wget https://github.com/Netflix/vmaf/archive/v2.1.1.tar.gz && \
     ninja install
 
 FROM build AS vpx
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 RUN git -C libvpx pull 2> /dev/null || git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git && \
     cd libvpx && \
     ./configure --disable-unit-tests --enable-vp9-highbitdepth --enable-shared --enable-tools --as=yasm --enable-vp9 && \
@@ -132,6 +142,8 @@ RUN git -C libvpx pull 2> /dev/null || git clone --depth 1 https://chromium.goog
 
 
 FROM build AS ffmpeg
+ARG CFLAGS="-O3 -march=znver1"
+ARG CXXFLAGS="-O3 -march=znver1"
 
 COPY --from=aom /usr/local/include /usr/local/include
 COPY --from=aom /usr/local/lib /usr/local/lib
