@@ -17,6 +17,7 @@ use clap::{App, Arg};
 use std::mem::size_of;
 use crate::aom_firstpass::AomFirstpass;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[tokio::main]
 async fn main() {
@@ -61,11 +62,26 @@ async fn main() {
             println!("child status was: {}", status);
         });
 
+        let analyzed_aom_frames = Arc::new(Semaphore::new(0));
         let header = VideoHeader::read(&mut vs_pipe_reader).await.unwrap();
-        let buffer = Arc::new(FrameBuffer::new(32, header.clone()));
+
+        let buffer = Arc::new(FrameBuffer::new(33, header.clone()));
         header.clone().write(&mut writer).await;
 
         let mut status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
+        let popper_buf = buffer.clone();
+        let delayed_aom = analyzed_aom_frames.clone();
+        let delayed_popper = task::spawn(async move {
+            delayed_aom.acquire_many(32).await.unwrap().forget();
+            loop {
+                delayed_aom.acquire().await.unwrap().forget();
+                let frame = popper_buf.pop().await;
+                if frame.is_none() {
+                    break;
+                }
+            }
+        });
+
         let writing_buf = buffer.clone();
         let writing = task::spawn(async move {
             let mut frame_num = 0;
@@ -73,8 +89,9 @@ async fn main() {
                 let frame = writing_buf.get_frame(frame_num).await;
                 if let Some(f) = frame {
                     f.write(&mut writer).await;
-                    writing_buf.pop().await;
+                    analyzed_aom_frames.add_permits(1)
                 } else {
+                    analyzed_aom_frames.add_permits(100);
                     break;
                 }
                 frame_num += 1;
@@ -85,5 +102,6 @@ async fn main() {
             status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         }
         writing.await;
+        delayed_popper.await;
     }
 }
