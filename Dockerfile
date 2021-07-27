@@ -146,7 +146,7 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
       --enable-libvpx \
       --enable-vapoursynth \
       --enable-nonfree && \
-    make && \
+    make -j`nproc` && \
     make install
 
 FROM runtime
