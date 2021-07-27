@@ -23,8 +23,8 @@ ENV RUSTFLAGS "-C target-cpu=znver1"
 RUN cargo build --release
 
 FROM runtime AS build
-ARG CFLAGS="-O3 -march=znver1"
-ARG CXXFLAGS="-O3 -march=znver1"
+ARG CFLAGS="-O3 -march=znver1 -fPIC"
+ARG CXXFLAGS="-O3 -march=znver1 -fPIC"
 RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
