@@ -34,14 +34,9 @@ RUN apt-get update && apt-get install -y \
     git-core \
     libass-dev \
     libfreetype6-dev \
-    libgnutls28-dev \
-    libsdl2-dev \
     libtool \
     libva-dev \
     libvdpau-dev \
-    libxcb1-dev \
-    libxcb-shm0-dev \
-    libxcb-xfixes0-dev \
     nasm \
     ninja-build \
     perl \
@@ -124,6 +119,9 @@ COPY --from=dav1d /usr/local/lib /usr/local/lib
 COPY --from=opus /usr/local/include /usr/local/include
 COPY --from=opus /usr/local/lib /usr/local/lib
 
+COPY --from=vapoursynth /usr/local/include /usr/local/include
+COPY --from=vapoursynth /usr/local/lib /usr/local/lib
+
 COPY --from=vmaf /usr/local/include /usr/local/include
 COPY --from=vmaf /usr/local/lib /usr/local/lib
 
@@ -139,7 +137,6 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
       --extra-libs="-lpthread -lm" \
       --ld="g++" \
       --enable-gpl \
-      --enable-gnutls \
       --enable-libaom \
       --enable-libass \
       --enable-libfreetype \
@@ -147,6 +144,7 @@ RUN wget -O ffmpeg-snapshot.tar.bz2 https://ffmpeg.org/releases/ffmpeg-snapshot.
       --enable-libdav1d \
       --enable-libvmaf \
       --enable-libvpx \
+      --enable-vapoursynth \
       --enable-nonfree && \
     make && \
     make install
