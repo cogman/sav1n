@@ -1,7 +1,6 @@
 pub mod aom {
     use tokio::io::{AsyncRead, AsyncReadExt, Error};
     use core::mem;
-    use std::ops::Div;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -182,7 +181,7 @@ pub mod aom {
             return if frame_count_so_far >= adapt_upto {
                 min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
             } else {
-                min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1)) * second_ref_usage_thresh_max_delta
+                min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1.0)) * second_ref_usage_thresh_max_delta
             };
         }
 
@@ -203,7 +202,7 @@ pub mod aom {
             let total_frames_to_test = 16;
             let count_for_tolerable_prediction = 3;
 
-            if frame_count_so_far >= 3
+            if self.frame >= 3.0
                 && (self.pcnt_second_ref < second_ref_usage_thresh) &&
                 (next_frame.pcnt_second_ref < second_ref_usage_thresh) &&
                 ((self.pcnt_inter < Self::VERY_LOW_INTER_THRESH) ||
@@ -229,8 +228,8 @@ pub mod aom {
                 for i in 0 .. total_frames_to_test {
                     j = i;
                     let local_next_frame = future_frames[i];
-                    let mut next_iiratio = (Self::BOOST_FACTOR * local_next_frame.intra_error /
-                        Self::double_divide_check(local_next_frame.coded_error));
+                    let mut next_iiratio = Self::BOOST_FACTOR * local_next_frame.intra_error /
+                        Self::double_divide_check(local_next_frame.coded_error);
 
                     if next_iiratio > Self::KF_II_MAX {
                         next_iiratio = Self::KF_II_MAX;
@@ -243,7 +242,7 @@ pub mod aom {
                         decay_accumulator *= (0.85 + local_next_frame.pcnt_inter) / 2.0;
                     }
 
-                    boost_score += (decay_accumulator * next_iiratio);
+                    boost_score += decay_accumulator * next_iiratio;
 
                     if (local_next_frame.pcnt_inter < 0.05) || (next_iiratio < 1.5) ||
                         (((local_next_frame.pcnt_inter - local_next_frame.pcnt_neutral) <

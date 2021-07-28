@@ -111,14 +111,14 @@ pub mod frame_buffer {
             else {
                 tail -= 1;
             }
-            let mut tail_num = self.frame_index(tail).num;
+            let tail_num = self.frame_index(tail).num;
             let head = unsafe { (*self.ptr()).head };
             let head_num = self.frame_index(head).num;
             if frame_num < head_num {
                 panic!("Frame fell out of buffer! asked for {}, earliest frame is {}", frame_num, head_num)
             }
             let offset = tail_num - frame_num;
-            let mut index: u64;
+            let index: u64;
             if offset > tail as u64 {
                 let leftover = offset - tail as u64;
                 index = self.frames_len as u64 - leftover;
@@ -139,7 +139,7 @@ pub mod frame_buffer {
                 .forget();
             let _ = self.std_mutex.acquire().await.unwrap().forget();
             unsafe {
-                let mut ptr = (self.ptr());
+                let mut ptr = self.ptr();
                 let tail = (*ptr).tail;
                 (*ptr).tail += 1;
                 if (*ptr).tail >= self.frames_len {

@@ -4,17 +4,13 @@ mod video_header;
 mod aom_firstpass;
 
 use crate::frame_buffer::frame_buffer::FrameBuffer;
-use crate::frame::frame::Frame;
-use std::alloc::Layout;
 use crate::video_header::VideoHeader;
 use tokio::process::Command;
 use tokio::task;
 use std::process::Stdio;
-use std::convert::TryInto;
-use tokio::io::{BufReader, AsyncBufReadExt, BufWriter, AsyncWriteExt};
+use tokio::io::{BufReader, BufWriter};
 use crate::frame::frame::Status::Processing;
 use clap::{App, Arg};
-use std::mem::size_of;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -48,8 +44,8 @@ async fn main() {
             .stdin(Stdio::piped())
             .spawn().unwrap();
 
-        let mut vspipe_output = vspipe.stdout.take().unwrap();
-        let mut aom_input = aom.stdin.take().unwrap();
+        let vspipe_output = vspipe.stdout.take().unwrap();
+        let aom_input = aom.stdin.take().unwrap();
 
         let mut vs_pipe_reader = BufReader::with_capacity(1024, vspipe_output);
         let mut writer = BufWriter::with_capacity(1024, aom_input);
