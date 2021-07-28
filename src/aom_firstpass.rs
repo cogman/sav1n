@@ -1,6 +1,7 @@
 pub mod aom {
     use tokio::io::{AsyncRead, AsyncReadExt, Error};
     use core::mem;
+    use std::collections::VecDeque;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -194,7 +195,7 @@ pub mod aom {
         const BOOST_FACTOR: f64 = 12.5;
         const KF_II_MAX: f64 = 128.0;
 
-        pub fn test_candidate_kf(self, last_frame: AomFirstpass, next_frame: AomFirstpass, future_frames: &[AomFirstpass; 16]) -> bool {
+        pub fn test_candidate_kf(self, last_frame: AomFirstpass, next_frame: AomFirstpass, future_frames: VecDeque<AomFirstpass>) -> bool {
             let mut is_viable_kf = false;
             let pcnt_intra = 1.0 - self.pcnt_neutral;
             let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
