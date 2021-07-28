@@ -175,14 +175,14 @@ pub mod aom {
             return Ok(firstpass);
         }
 
-        fn get_second_ref_usage_thresh(frame_count_so_far: u64) -> f64 {
-            let adapt_upto = 32;
+        fn second_ref_usage_thresh(frame_count_so_far: f64) -> f64 {
+            let adapt_upto = 32.0;
             let min_second_ref_usage_thresh = 0.085;
             let second_ref_usage_thresh_max_delta = 0.035;
             return if frame_count_so_far >= adapt_upto {
                 min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
             } else {
-                min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1)) as f64 * second_ref_usage_thresh_max_delta
+                min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1)) * second_ref_usage_thresh_max_delta
             };
         }
 
@@ -195,11 +195,11 @@ pub mod aom {
         const BOOST_FACTOR: f64 = 12.5;
         const KF_II_MAX: f64 = 128.0;
 
-        pub fn test_candidate_kf(self, last_frame: AomFirstpass, next_frame: AomFirstpass, future_frames: &[AomFirstpass; 16], frame_count_so_far: u64) -> bool {
+        pub fn test_candidate_kf(self, last_frame: AomFirstpass, next_frame: AomFirstpass, future_frames: &[AomFirstpass; 16]) -> bool {
             let mut is_viable_kf = false;
             let pcnt_intra = 1.0 - self.pcnt_neutral;
             let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
-            let second_ref_usage_thresh = Self::get_second_ref_usage_thresh(frame_count_so_far);
+            let second_ref_usage_thresh = Self::second_ref_usage_thresh(self.frame);
             let total_frames_to_test = 16;
             let count_for_tolerable_prediction = 3;
 
