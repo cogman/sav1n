@@ -24,7 +24,7 @@ async fn main() {
             .long("input")
             .about("Input file")
             .required(true)
-            .multiple(false)
+            .multiple_values(true)
             .takes_value(true))
         .get_matches();
 
