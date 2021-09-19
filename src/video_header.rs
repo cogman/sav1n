@@ -29,7 +29,7 @@ pub struct VideoHeader {
 
 impl VideoHeader {
     pub fn new() -> Self {
-        return VideoHeader {
+        VideoHeader {
             width: 240,
             height: 160,
             rate: "1234".to_string(),
@@ -43,7 +43,7 @@ impl VideoHeader {
     pub fn calc_frame_size(&self) -> usize {
         let ctype = self.color_space_type.as_ref().unwrap_or(&C420p10);
         let pixels: usize = (self.width * self.height) as usize;
-        return match ctype {
+        match ctype {
             ColorSpaceType::C410 => (pixels * 5) / 4, // 10 bits?
             ColorSpaceType::C411 => (pixels * 3) / 2, // 12 bits
             ColorSpaceType::C420p10 => pixels * 3,    // 10 bits
@@ -106,7 +106,7 @@ impl VideoHeader {
         }
 
         header.push(b'\x0A');
-        return Ok(VideoHeader {
+        Ok(VideoHeader {
             width: width?,
             height: height?,
             rate: rate?,

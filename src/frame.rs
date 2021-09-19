@@ -18,7 +18,7 @@ pub mod frame {
 
     impl<'a> Frame {
         pub fn new(data_len: usize, num: u64) -> Self {
-            return Frame {
+            Frame {
                 droppable: true,
                 data_len,
                 num,
@@ -44,13 +44,13 @@ pub mod frame {
             }
             assert_eq!(&header, b"FRAME\x0A");
             reader.read_exact(self.data_mut()).await?;
-            return Ok(Status::Processing);
+            Ok(Status::Processing)
         }
 
         pub async fn write(&self, writer: &mut (impl AsyncWriteExt + Unpin)) -> io::Result<()> {
             writer.write_all(b"FRAME\x0A").await?;
             writer.write_all(self.data()).await?;
-            return Ok(())
+            Ok(())
         }
     }
 
@@ -62,7 +62,7 @@ pub mod frame {
                     .expect("weird layout"));
                 std::ptr::copy(self.data, data_ptr, self.data_len);
             }
-            return Frame {
+            Frame {
                 num: self.num,
                 data_len: self.data_len,
                 droppable: true,

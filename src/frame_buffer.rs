@@ -69,14 +69,14 @@ pub mod frame_buffer {
                 unsafe { (*frame).data = frame_addr.add(frame_header.size()); }
             }
 
-            return frame_buffer;
+            frame_buffer
         }
 
         fn frame_addr(&self, i: usize) -> *mut u8 {
-            let frame_addr = unsafe {
+            
+            unsafe {
                 (*self.ptr()).frames.add(self.frame_layout.size() * i)
-            };
-            return frame_addr;
+            }
         }
 
         fn frame_index(&self, i: usize) -> &'a mut Frame {
@@ -130,7 +130,7 @@ pub mod frame_buffer {
             if frame.num != frame_num {
                 panic!("Returned the wrong frame! Returned {} asked for {}", frame.num, frame_num);
             }
-            return Some(frame);
+            Some(frame)
         }
 
         async fn reserve_frame(&self) -> &'a mut Frame {
@@ -150,7 +150,7 @@ pub mod frame_buffer {
                 frame.num = (*ptr).frame_number;
                 frame.data_len = self.frame_size;
                 (*ptr).frame_number += 1;
-                return frame;
+                frame
             }
         }
 
@@ -173,7 +173,7 @@ pub mod frame_buffer {
             }
             self.wait_for_frame.notify_waiters();
             self.std_mutex.add_permits(1); // Released because reserve_frame forgets std_mutex
-            return Ok(status);
+            Ok(status)
         }
 
         pub async fn pop(&self) -> Option<&'a Frame> {
@@ -198,11 +198,11 @@ pub mod frame_buffer {
 
         pub async fn size(&self) -> usize {
             let _ = self.std_mutex.acquire().await.unwrap();
-            return unsafe { (*self.ptr()).size };
+            unsafe { (*self.ptr()).size }
         }
 
         fn ptr(&self) -> *mut FrameBufferData {
-            return self.data.get()
+            self.data.get()
         }
     }
 

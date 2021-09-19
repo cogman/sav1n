@@ -132,7 +132,7 @@ pub mod aom {
 
     impl AomFirstpass {
         fn empty() -> AomFirstpass {
-            return AomFirstpass {
+            AomFirstpass {
                 frame: 0.0,
                 weight: 0.0,
                 intra_error: 0.0,
@@ -160,7 +160,7 @@ pub mod aom {
                 is_flash: 0,
                 noise_var: 0.0,
                 cor_coeff: 0.0,
-            };
+            }
         }
 
         pub async fn read_aom_firstpass(reader: &mut (impl AsyncRead + Unpin)) -> Result<AomFirstpass, Error> {
@@ -172,18 +172,18 @@ pub mod aom {
                 );
                 reader.read_exact(buffer).await?;
             }
-            return Ok(firstpass);
+            Ok(firstpass)
         }
 
         fn second_ref_usage_thresh(frame_count_so_far: f64) -> f64 {
             let adapt_upto = 32.0;
             let min_second_ref_usage_thresh = 0.085;
             let second_ref_usage_thresh_max_delta = 0.035;
-            return if frame_count_so_far >= adapt_upto {
+            if frame_count_so_far >= adapt_upto {
                 min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
             } else {
                 min_second_ref_usage_thresh + (frame_count_so_far / (adapt_upto - 1.0)) * second_ref_usage_thresh_max_delta
-            };
+            }
         }
 
         const VERY_LOW_INTER_THRESH: f64 = 0.05;
@@ -262,23 +262,23 @@ pub mod aom {
                 }
             }
 
-            return is_viable_kf;
+            is_viable_kf
         }
 
         const VERY_LOW_II: f64 = 1.5;
         const ERROR_SPIKE: f64 = 5.0;
         fn slide_transition(self, last_frame: AomFirstpass, next_frame: AomFirstpass) -> bool {
-            return (self.intra_error < (self.coded_error * Self::VERY_LOW_II))
+            (self.intra_error < (self.coded_error * Self::VERY_LOW_II))
                 && (self.coded_error > (last_frame.coded_error * Self::ERROR_SPIKE))
-                && (self.coded_error > (next_frame.coded_error * Self::ERROR_SPIKE));
+                && (self.coded_error > (next_frame.coded_error * Self::ERROR_SPIKE))
         }
 
         fn double_divide_check(x: f64) -> f64 {
-            return if x < 0.0 {
+            if x < 0.0 {
                 x - 0.000001
             } else {
                 x + 0.000001
-            };
+            }
         }
     }
 }
