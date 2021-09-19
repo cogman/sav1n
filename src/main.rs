@@ -29,7 +29,7 @@ async fn main() {
         .get_matches();
 
     if let Some(input) = options.value_of("input") {
-        let mut vspipe = Command::new("vspipe").arg("--y4m").arg(input).arg("-")
+        let mut vspipe = Command::new("vspipe").arg("-c y4m").arg(input).arg("-")
             .stdout(Stdio::piped())
             .spawn().unwrap();
 
@@ -61,7 +61,7 @@ async fn main() {
         let header = VideoHeader::read(&mut vs_pipe_reader).await.unwrap();
 
         let buffer = Arc::new(FrameBuffer::new(33, header.clone()));
-        header.clone().write(&mut writer).await;
+        header.clone().write(&mut writer).await.unwrap();
 
         let mut status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         let popper_buf = buffer.clone();
@@ -83,7 +83,7 @@ async fn main() {
             loop {
                 let frame = writing_buf.get_frame(frame_num).await;
                 if let Some(f) = frame {
-                    f.write(&mut writer).await;
+                    f.write(&mut writer).await.unwrap();
                     analyzed_aom_frames.add_permits(1)
                 } else {
                     analyzed_aom_frames.add_permits(100);
@@ -96,7 +96,7 @@ async fn main() {
         while status == Processing {
             status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         }
-        writing.await;
-        delayed_popper.await;
+        writing.await.unwrap();
+        delayed_popper.await.unwrap();
     }
 }
