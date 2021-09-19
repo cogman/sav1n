@@ -1,37 +1,43 @@
-mod frame_buffer;
-mod frame;
-mod video_header;
 mod aom_firstpass;
+mod frame;
+mod frame_buffer;
+mod video_header;
 
-use crate::frame_buffer::frame_buffer::FrameBuffer;
+use crate::frame::Status::Processing;
+use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
-use tokio::process::Command;
-use tokio::task;
-use std::process::Stdio;
-use tokio::io::{BufReader, BufWriter};
-use crate::frame::frame::Status::Processing;
 use clap::{App, Arg};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{BufReader, BufWriter};
+use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task;
 
 #[tokio::main]
 async fn main() {
     let options = App::new("sav1n")
         .version("0.0.1")
         .author("Thomas May")
-        .arg(Arg::new("input")
-            .short('i')
-            .long("input")
-            .about("Input file")
-            .required(true)
-            .multiple_values(true)
-            .takes_value(true))
+        .arg(
+            Arg::new("input")
+                .short('i')
+                .long("input")
+                .about("Input file")
+                .required(true)
+                .multiple_values(true)
+                .takes_value(true),
+        )
         .get_matches();
 
     if let Some(input) = options.value_of("input") {
-        let mut vspipe = Command::new("vspipe").arg("-c y4m").arg(input).arg("-")
+        let mut vspipe = Command::new("vspipe")
+            .arg("-c y4m")
+            .arg(input)
+            .arg("-")
             .stdout(Stdio::piped())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
 
         let mut aom = Command::new("aomenc")
             .arg("--passes=2")
@@ -40,9 +46,11 @@ async fn main() {
             .arg("--end-usage=q")
             .arg("--threads=32")
             .arg("-o")
-            .arg("/dev/null").arg("-")
+            .arg("/dev/null")
+            .arg("-")
             .stdin(Stdio::piped())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
 
         let vspipe_output = vspipe.stdout.take().unwrap();
         let aom_input = aom.stdin.take().unwrap();
@@ -51,7 +59,9 @@ async fn main() {
         let mut writer = BufWriter::with_capacity(1024, aom_input);
 
         task::spawn(async move {
-            let status = vspipe.wait().await
+            let status = vspipe
+                .wait()
+                .await
                 .expect("child process encountered an error");
             let _ = aom.wait().await.expect("aom failed to start");
             println!("child status was: {}", status);
