@@ -6,57 +6,27 @@ mod video_header;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
-use clap::{App, Arg};
+use clap::{App, Arg, ArgMatches};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{BufReader, BufWriter};
-use tokio::process::Command;
+use tokio::process::{Command, Child};
 use tokio::sync::Semaphore;
 use tokio::task;
 
 #[tokio::main]
 async fn main() {
-    let options = App::new("sav1n")
-        .version("0.0.1")
-        .author("Thomas May")
-        .arg(
-            Arg::new("input")
-                .short('i')
-                .long("input")
-                .about("Input file")
-                .required(true)
-                .multiple_values(true)
-                .takes_value(true),
-        )
-        .get_matches();
+    let options = extract_options();
 
     if let Some(input) = options.value_of("input") {
-        let mut vspipe = Command::new("vspipe")
-            .arg("-c y4m")
-            .arg(input)
-            .arg("-")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let mut aom = Command::new("aomenc")
-            .arg("--passes=2")
-            .arg("--pass=1")
-            .arg("--fpf=keyframe.log")
-            .arg("--end-usage=q")
-            .arg("--threads=32")
-            .arg("-o")
-            .arg("/dev/null")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut vspipe = start_vspipe(input);
+        let mut aom = start_aom_scene_detection();
 
         let vspipe_output = vspipe.stdout.take().unwrap();
         let aom_input = aom.stdin.take().unwrap();
 
         let mut vs_pipe_reader = BufReader::with_capacity(1024, vspipe_output);
-        let mut writer = BufWriter::with_capacity(1024, aom_input);
+        let mut aom_stdin_writer = BufWriter::with_capacity(1024, aom_input);
 
         task::spawn(async move {
             let status = vspipe
@@ -71,7 +41,7 @@ async fn main() {
         let header = VideoHeader::read(&mut vs_pipe_reader).await.unwrap();
 
         let buffer = Arc::new(FrameBuffer::new(33, header.clone()));
-        header.clone().write(&mut writer).await.unwrap();
+        header.clone().write(&mut aom_stdin_writer).await.unwrap();
 
         let mut status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         let popper_buf = buffer.clone();
@@ -93,7 +63,7 @@ async fn main() {
             loop {
                 let frame = writing_buf.get_frame(frame_num).await;
                 if let Some(f) = frame {
-                    f.write(&mut writer).await.unwrap();
+                    f.write(&mut aom_stdin_writer).await.unwrap();
                     analyzed_aom_frames.add_permits(1)
                 } else {
                     analyzed_aom_frames.add_permits(100);
@@ -109,4 +79,45 @@ async fn main() {
         writing.await.unwrap();
         delayed_popper.await.unwrap();
     }
+}
+
+fn start_aom_scene_detection() -> Child {
+    Command::new("aomenc")
+        .arg("--passes=2")
+        .arg("--pass=1")
+        .arg("--fpf=keyframe.log")
+        .arg("--end-usage=q")
+        .arg("--threads=32")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn start_vspipe(input: &str) -> Child {
+    Command::new("vspipe")
+        .arg("-c y4m")
+        .arg(input)
+        .arg("-")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn extract_options() -> ArgMatches {
+    App::new("sav1n")
+        .version("0.0.1")
+        .author("Thomas May")
+        .arg(
+            Arg::new("input")
+                .short('i')
+                .long("input")
+                .about("Input file")
+                .required(true)
+                .multiple_values(true)
+                .takes_value(true),
+        )
+        .get_matches()
 }
