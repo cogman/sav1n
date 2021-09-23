@@ -1,4 +1,7 @@
 from vapoursynth import core
 import vapoursynth as vs
 
-core.std.BlankClip(format=vs.YUV420P10,length=1000).set_output()
+clip = core.lsmas.LWLibavSource('ToS-4k-1920.mov')
+
+clip = clip.std.Trim(first=1000, last=2000)
+clip.set_output()

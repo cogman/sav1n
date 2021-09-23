@@ -3,3 +3,6 @@
 sav1n.iml
 tc.dat
 keyframe.log
+*.mov
+*.lwi
+*.y4m

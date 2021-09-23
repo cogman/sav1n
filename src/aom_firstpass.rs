@@ -177,15 +177,15 @@ pub mod aom {
             Ok(firstpass)
         }
 
-        fn second_ref_usage_thresh(frame_count_so_far: f64) -> f64 {
-            let adapt_upto = 32.0;
+        fn second_ref_usage_thresh(frame_count_so_far: u64) -> f64 {
+            let adapt_upto = 32;
             let min_second_ref_usage_thresh = 0.085;
             let second_ref_usage_thresh_max_delta = 0.035;
             if frame_count_so_far >= adapt_upto {
                 min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
             } else {
                 min_second_ref_usage_thresh
-                    + (frame_count_so_far / (adapt_upto - 1.0)) * second_ref_usage_thresh_max_delta
+                    + (frame_count_so_far as f64 / (adapt_upto - 1) as f64) * second_ref_usage_thresh_max_delta
             }
         }
 
@@ -200,34 +200,37 @@ pub mod aom {
 
         pub fn test_candidate_kf(
             self,
-            last_frame: &AomFirstpass,
+            last_stats: &AomFirstpass,
             future_frames: &VecDeque<AomFirstpass>,
+            frame_since_last_scene: u64,
+            num_mbs: u32
         ) -> bool {
-            let next_frame = future_frames[0];
+            let next_stats = future_frames[0];
+
             let mut is_viable_kf = false;
-            let pcnt_intra = 1.0 - self.pcnt_neutral;
+            let pcnt_intra = 1.0 - self.pcnt_inter;
             let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
-            let second_ref_usage_thresh = Self::second_ref_usage_thresh(self.frame);
-            let total_frames_to_test = 16;
+            let second_ref_usage_thresh = Self::second_ref_usage_thresh(frame_since_last_scene);
+            let frames_to_test_after_candidate_key  = 16;
             let count_for_tolerable_prediction = 3;
 
-            if self.frame >= 3.0
+            if frame_since_last_scene >= 3
                 && (self.pcnt_second_ref < second_ref_usage_thresh)
-                && (next_frame.pcnt_second_ref < second_ref_usage_thresh)
+                && (next_stats.pcnt_second_ref < second_ref_usage_thresh)
                 && ((self.pcnt_inter < Self::VERY_LOW_INTER_THRESH)
-                    || self.slide_transition(last_frame, next_frame)
+                    || self.slide_transition(last_stats, next_stats)
                     || ((pcnt_intra > Self::MIN_INTRA_LEVEL)
                         && (pcnt_intra > (Self::INTRA_VS_INTER_THRESH * modified_pcnt_inter))
                         && ((self.intra_error / Self::double_divide_check(self.coded_error))
                             < Self::KF_II_ERR_THRESHOLD)
-                        && (((last_frame.coded_error - self.coded_error).abs()
+                        && (((last_stats.coded_error - self.coded_error).abs()
                             / Self::double_divide_check(self.coded_error)
                             > Self::ERR_CHANGE_THRESHOLD)
-                            || ((last_frame.intra_error - self.intra_error).abs()
+                            || ((last_stats.intra_error - self.intra_error).abs()
                                 / Self::double_divide_check(self.intra_error)
                                 > Self::ERR_CHANGE_THRESHOLD)
-                            || ((next_frame.intra_error
-                                / Self::double_divide_check(next_frame.coded_error))
+                            || ((next_stats.intra_error
+                                / Self::double_divide_check(next_stats.coded_error))
                                 > Self::II_IMPROVEMENT_THRESHOLD))))
             {
                 let mut boost_score = 0.0;
@@ -235,9 +238,9 @@ pub mod aom {
                 let mut decay_accumulator = 1.0;
                 let mut j = 0;
                 for (i, local_next_frame) in
-                    future_frames.iter().enumerate().take(total_frames_to_test)
+                    future_frames.iter().enumerate().take(frames_to_test_after_candidate_key)
                 {
-                    j = i;
+                    j = i + 1;
                     let mut next_iiratio = Self::BOOST_FACTOR * local_next_frame.intra_error
                         / Self::double_divide_check(local_next_frame.coded_error);
 
@@ -258,17 +261,14 @@ pub mod aom {
                         || (((local_next_frame.pcnt_inter - local_next_frame.pcnt_neutral) < 0.20)
                             && (next_iiratio < 3.0))
                         || ((boost_score - old_boost_score) < 3.0)
-                        || (local_next_frame.intra_error < (200.0))
+                        || (local_next_frame.intra_error < (200.0 / num_mbs as f64))
                     {
                         break;
                     }
                     old_boost_score = boost_score;
                 }
-                if boost_score > 30.0 && (j > count_for_tolerable_prediction) {
-                    is_viable_kf = true;
-                } else {
-                    is_viable_kf = false;
-                }
+
+                is_viable_kf = boost_score > 30.0 && (j > count_for_tolerable_prediction)
             }
 
             is_viable_kf

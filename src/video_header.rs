@@ -9,6 +9,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, Error};
 pub enum ColorSpaceType {
     C410,
     C411,
+    C420,
     C420p10,
     C422,
     C440,
@@ -47,6 +48,7 @@ impl VideoHeader {
             ColorSpaceType::C410 => (pixels * 5) / 4, // 10 bits?
             ColorSpaceType::C411 => (pixels * 3) / 2, // 12 bits
             ColorSpaceType::C420p10 => pixels * 3,    // 10 bits
+            ColorSpaceType::C420 => (pixels * 3) / 2,       // 10 bits
             ColorSpaceType::C422 => pixels * 2,       // 16 bits
             ColorSpaceType::C440 => pixels * 2,       // 16 bits?
             ColorSpaceType::C444 => pixels * 3,       // 24 bits
@@ -103,6 +105,7 @@ impl VideoHeader {
                     "410" => color_space_type = Some(ColorSpaceType::C410),
                     "411" => color_space_type = Some(ColorSpaceType::C411),
                     "420p10" => color_space_type = Some(ColorSpaceType::C420p10),
+                    "420" => color_space_type = Some(ColorSpaceType::C420),
                     "422" => color_space_type = Some(ColorSpaceType::C422),
                     "440" => color_space_type = Some(ColorSpaceType::C440),
                     "444" => color_space_type = Some(ColorSpaceType::C444),
