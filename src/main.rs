@@ -49,15 +49,17 @@ async fn main() {
             let mut file = File::create(format!("{:06}.y4m", scene)).await.unwrap();
             vpx_header.clone().write(&mut file).await;
             while let Ok(stat) = stats_rx.recv().await {
-                let frame = scene_buffer.pop().await;
                 if stat.is_keyframe {
                     file.shutdown();
                     scene += 1;
                     file = File::create(format!("{:06}.y4m", scene)).await.unwrap();
                     vpx_header.clone().write(&mut file).await;
                 }
+                let frame = scene_buffer.get_frame(stat.frame_num).await;
                 if let Some(frame_data) = frame {
+                    assert_eq!(stat.frame_num, frame_data.num);
                     frame_data.write(&mut file).await;
+                    scene_buffer.pop().await;
                 }
                 else {
                     break;
