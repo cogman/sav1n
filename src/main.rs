@@ -3,22 +3,19 @@ mod frame;
 mod frame_buffer;
 mod video_header;
 
+use crate::aom_firstpass::aom::AomFirstpass;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
 use clap::{App, Arg, ArgMatches};
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{BufReader, BufWriter, AsyncWriteExt, AsyncWrite, ErrorKind};
-use tokio::process::{Command, Child};
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
+use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
 use tokio::task;
-use std::collections::VecDeque;
-use crate::aom_firstpass::aom::AomFirstpass;
-use tokio::fs::File;
-use std::time::Duration;
-use tokio::time::sleep;
-use std::net::Shutdown;
 
 #[tokio::main]
 async fn main() {
@@ -53,13 +50,20 @@ async fn main() {
         let delayed_popper = task::spawn(async move {
             delayed_aom.acquire_many(96).await.unwrap().forget();
             let mut frame_stats = VecDeque::new();
-            let mut keyframe = BufReader::with_capacity(1024, File::open("/tmp/keyframe.log").await.unwrap());
-            let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe).await.unwrap();
+            let mut keyframe =
+                BufReader::with_capacity(1024, File::open("/tmp/keyframe.log").await.unwrap());
+            let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe)
+                .await
+                .unwrap();
             println!("frame stats: {} ", current.frame);
             let mut last = current;
             // Fill up the frame buffer
             while frame_stats.len() < 16 {
-                frame_stats.push_back(AomFirstpass::read_aom_firstpass(&mut keyframe).await.unwrap());
+                frame_stats.push_back(
+                    AomFirstpass::read_aom_firstpass(&mut keyframe)
+                        .await
+                        .unwrap(),
+                );
             }
             loop {
                 delayed_aom.acquire().await.unwrap().forget();
@@ -79,8 +83,7 @@ async fn main() {
                         if e.kind() == ErrorKind::UnexpectedEof {
                             println!("stats done!");
                             break;
-                        }
-                        else {
+                        } else {
                             panic!("Exploded unexpectedly! {}", e)
                         }
                     }
