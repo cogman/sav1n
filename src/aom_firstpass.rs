@@ -200,10 +200,10 @@ pub mod aom {
 
         pub fn test_candidate_kf(
             self,
-            last_frame: AomFirstpass,
-            next_frame: AomFirstpass,
-            future_frames: VecDeque<AomFirstpass>,
+            last_frame: &AomFirstpass,
+            future_frames: &VecDeque<AomFirstpass>,
         ) -> bool {
+            let next_frame = future_frames[0];
             let mut is_viable_kf = false;
             let pcnt_intra = 1.0 - self.pcnt_neutral;
             let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
@@ -276,7 +276,7 @@ pub mod aom {
 
         const VERY_LOW_II: f64 = 1.5;
         const ERROR_SPIKE: f64 = 5.0;
-        fn slide_transition(self, last_frame: AomFirstpass, next_frame: AomFirstpass) -> bool {
+        fn slide_transition(self, last_frame: &AomFirstpass, next_frame: AomFirstpass) -> bool {
             (self.intra_error < (self.coded_error * Self::VERY_LOW_II))
                 && (self.coded_error > (last_frame.coded_error * Self::ERROR_SPIKE))
                 && (self.coded_error > (next_frame.coded_error * Self::ERROR_SPIKE))

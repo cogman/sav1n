@@ -9,10 +9,16 @@ use crate::video_header::VideoHeader;
 use clap::{App, Arg, ArgMatches};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::{BufReader, BufWriter, AsyncWriteExt, AsyncWrite, ErrorKind};
 use tokio::process::{Command, Child};
 use tokio::sync::Semaphore;
 use tokio::task;
+use std::collections::VecDeque;
+use crate::aom_firstpass::aom::AomFirstpass;
+use tokio::fs::File;
+use std::time::Duration;
+use tokio::time::sleep;
+use std::net::Shutdown;
 
 #[tokio::main]
 async fn main() {
@@ -23,36 +29,61 @@ async fn main() {
         let mut aom = start_aom_scene_detection();
 
         let vspipe_output = vspipe.stdout.take().unwrap();
-        let aom_input = aom.stdin.take().unwrap();
+        let mut aom_input = aom.stdin.take().unwrap();
 
         let mut vs_pipe_reader = BufReader::with_capacity(1024, vspipe_output);
-        let mut aom_stdin_writer = BufWriter::with_capacity(1024, aom_input);
 
         task::spawn(async move {
             let status = vspipe
                 .wait()
                 .await
                 .expect("child process encountered an error");
-            let _ = aom.wait().await.expect("aom failed to start");
             println!("child status was: {}", status);
         });
 
         let analyzed_aom_frames = Arc::new(Semaphore::new(0));
         let header = VideoHeader::read(&mut vs_pipe_reader).await.unwrap();
 
-        let buffer = Arc::new(FrameBuffer::new(33, header.clone()));
-        header.clone().write(&mut aom_stdin_writer).await.unwrap();
+        let buffer = Arc::new(FrameBuffer::new(129, header.clone()));
+        header.clone().write(&mut aom_input).await.unwrap();
 
         let mut status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
         let popper_buf = buffer.clone();
         let delayed_aom = analyzed_aom_frames.clone();
         let delayed_popper = task::spawn(async move {
-            delayed_aom.acquire_many(32).await.unwrap().forget();
+            delayed_aom.acquire_many(96).await.unwrap().forget();
+            let mut frame_stats = VecDeque::new();
+            let mut keyframe = BufReader::with_capacity(1024, File::open("/tmp/keyframe.log").await.unwrap());
+            let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe).await.unwrap();
+            println!("frame stats: {} ", current.frame);
+            let mut last = current;
+            // Fill up the frame buffer
+            while frame_stats.len() < 16 {
+                frame_stats.push_back(AomFirstpass::read_aom_firstpass(&mut keyframe).await.unwrap());
+            }
             loop {
                 delayed_aom.acquire().await.unwrap().forget();
                 let frame = popper_buf.pop().await;
                 if frame.is_none() {
                     break;
+                }
+                if current.test_candidate_kf(&last, &frame_stats) {
+                    println!("Keyframe!")
+                }
+                last = current;
+                current = frame_stats.pop_front().unwrap();
+                let stats = AomFirstpass::read_aom_firstpass(&mut keyframe).await;
+                match stats {
+                    Ok(stat) => frame_stats.push_back(stat),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::UnexpectedEof {
+                            println!("stats done!");
+                            break;
+                        }
+                        else {
+                            panic!("Exploded unexpectedly! {}", e)
+                        }
+                    }
                 }
             }
         });
@@ -63,9 +94,13 @@ async fn main() {
             loop {
                 let frame = writing_buf.get_frame(frame_num).await;
                 if let Some(f) = frame {
-                    f.write(&mut aom_stdin_writer).await.unwrap();
+                    f.write(&mut aom_input).await.unwrap();
                     analyzed_aom_frames.add_permits(1)
                 } else {
+                    aom_input.flush().await;
+                    aom_input.shutdown().await.unwrap();
+                    drop(aom_input);
+                    aom.wait().await.expect("AOM crashed");
                     analyzed_aom_frames.add_permits(100);
                     break;
                 }
@@ -85,7 +120,7 @@ fn start_aom_scene_detection() -> Child {
     Command::new("aomenc")
         .arg("--passes=2")
         .arg("--pass=1")
-        .arg("--fpf=keyframe.log")
+        .arg("--fpf=/tmp/keyframe.log")
         .arg("--end-usage=q")
         .arg("--threads=32")
         .arg("-o")
@@ -98,7 +133,7 @@ fn start_aom_scene_detection() -> Child {
 
 fn start_vspipe(input: &str) -> Child {
     Command::new("vspipe")
-        .arg("-c y4m")
+        .arg("--y4m")
         .arg(input)
         .arg("-")
         .stdout(Stdio::piped())
