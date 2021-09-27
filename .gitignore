@@ -6,3 +6,6 @@ keyframe.log
 *.mov
 *.lwi
 *.y4m
+*.log
+*.ivf
+timecodes.txt

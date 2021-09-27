@@ -9,6 +9,8 @@ edition = "2018"
 [dependencies]
 tokio = { version="^1", features=["io-std", "fs", "io-util", "time", "process", "macros", "rt-multi-thread", "sync"] }
 clap = "^3.0.0-beta.4"
+regex = "^1"
+lazy_static = "^1"
 
 [profile.release]
 opt-level = 3
