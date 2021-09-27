@@ -33,7 +33,8 @@ async fn main() {
 
     if let Some(input) = options.value_of("input") {
         let encoders = options.value_of_t_or_exit("encoders");
-        let mut vspipe = start_vspipe(input);
+        let vpy = options.value_of("vpy").unwrap();
+        let mut vspipe = start_vspipe(input, vpy);
 
         let vspipe_output = vspipe.stdout.take().unwrap();
 
@@ -80,7 +81,7 @@ fn vpx_process(mut stats_rx: Receiver<FrameStats>,
                encoders: usize) -> JoinHandle<()> {
     task::spawn(async move {
         let mut scene: u32 = 0;
-        let mut file = File::create(format!("{:06}.y4m", scene)).await.unwrap();
+        let mut file = File::create(format!("/tmp/{:06}.y4m", scene)).await.unwrap();
         vpx_header.clone().write(&mut file).await;
         while let Ok(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
@@ -99,7 +100,7 @@ fn vpx_process(mut stats_rx: Receiver<FrameStats>,
                 drop(guard);
                 compress_scene(scene, active_encodes_vpx.clone());
                 scene += 1;
-                file = File::create(format!("{:06}.y4m", scene)).await.unwrap();
+                file = File::create(format!("/tmp/{:06}.y4m", scene)).await.unwrap();
                 vpx_header.clone().write(&mut file).await;
             }
             let frame = scene_buffer.get_frame(stat.frame_num).await;
@@ -132,7 +133,7 @@ fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>) -> J
 }
 
 async fn first_pass(scene_number: u32) -> Child {
-    let scene_str = format!("{:06}", scene_number);
+    let scene_str = format!("/tmp/{:06}", scene_number);
     Command::new("vpxenc")
         .arg("--quiet")
         .arg("--passes=2")
@@ -151,7 +152,7 @@ async fn first_pass(scene_number: u32) -> Child {
 }
 
 async fn second_pass(scene_number: u32, cq: u32) -> Child {
-    let scene_str = format!("{:06}", scene_number);
+    let scene_str = format!("/tmp/{:06}", scene_number);
     Command::new("vpxenc")
         .arg(format!("--cq-level={}", cq))
         .arg("--quiet")
@@ -180,14 +181,14 @@ async fn second_pass(scene_number: u32, cq: u32) -> Child {
 }
 
 async fn cleanup(scene_number: u32) {
-    let scene_str = format!("{:06}", scene_number);
+    let scene_str = format!("/tmp/{:06}", scene_number);
     let remove_video = remove_file(format!("{}.y4m", scene_str));
     let remove_scene = remove_file(format!("{}.log", scene_str));
     join!(remove_video, remove_scene);
 }
 
 async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
-    let scene_str = format!("{:06}", scene_number);
+    let scene_str = format!("/tmp/{:06}", scene_number);
     let mut vpx = Command::new("vpxenc")
         .arg(format!("--cq-level={}", cq))
         .arg("--quiet")
@@ -405,13 +406,15 @@ fn start_aom_scene_detection() -> Child {
         .unwrap()
 }
 
-fn start_vspipe(input: &str) -> Child {
+fn start_vspipe(input: &str, vpy: &str) -> Child {
     Command::new("vspipe")
         .arg("-c")
         .arg("y4m")
         .arg("-t")
         .arg("timecodes.txt")
-        .arg(input)
+        .arg("--arg")
+        .arg(format!("file={}", input))
+        .arg(vpy)
         .arg("-")
         .stdout(Stdio::piped())
         .spawn()
@@ -428,7 +431,16 @@ fn extract_options() -> ArgMatches {
                 .long("input")
                 .about("Input file")
                 .required(true)
-                .multiple_values(true)
+                .multiple_values(false)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("vpy")
+                .short('v')
+                .long("vpy")
+                .about("vapoursynth file")
+                .required(true)
+                .multiple_values(false)
                 .takes_value(true),
         )
         .arg(
