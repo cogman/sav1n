@@ -32,9 +32,26 @@ async fn main() {
     let options = extract_options();
 
     if let Some(input) = options.value_of("input") {
+        let i = String::from(input);
         let encoders = options.value_of_t_or_exit("encoders");
-        let vpy = options.value_of("vpy").unwrap();
-        let mut vspipe = start_vspipe(input, vpy);
+        let vpy: String = options.value_of_t_or_exit("vpy");
+
+        let audio_processing = task::spawn(async move {
+            Command::new("ffmpeg")
+                .arg("-i")
+                .arg(i)
+                .arg("-vn")
+                .arg("-c:a")
+                .arg("libopus")
+                .arg("-b:a")
+                .arg("128k")
+                .arg("-vbr")
+                .arg("on")
+                .arg("/tmp/audio.mkv")
+                .spawn();
+        });
+
+        let mut vspipe = start_vspipe(input, vpy.as_str());
 
         let vspipe_output = vspipe.stdout.take().unwrap();
 
@@ -61,9 +78,10 @@ async fn main() {
         }
         drop(vs_pipe_reader);
         drop(vspipe);
-        vpx_processing.await;
-        aom_first_pass_scene.await;
+        vpx_processing.await.unwrap();
+        aom_first_pass_scene.await.unwrap();
         frame_stats_processor.await.unwrap();
+        audio_processing.await.unwrap();
         let encode_list = active_encodes.lock().await;
         let mut encode_len = encode_list.len();
         drop(encode_list);
@@ -411,7 +429,7 @@ fn start_vspipe(input: &str, vpy: &str) -> Child {
         .arg("-c")
         .arg("y4m")
         .arg("-t")
-        .arg("timecodes.txt")
+        .arg("/tmp/timecodes.txt")
         .arg("--arg")
         .arg(format!("file={}", input))
         .arg(vpy)
