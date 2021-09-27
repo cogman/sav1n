@@ -111,6 +111,9 @@ fn vpx_process(mut stats_rx: Receiver<FrameStats>,
                 break;
             }
         }
+        let mut guard = active_encodes_vpx.lock().await;
+        guard.push(scene);
+        drop(guard);
         compress_scene(scene, active_encodes_vpx.clone());
     })
 }
