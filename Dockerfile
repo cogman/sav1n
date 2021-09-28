@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y \
     libxcb1 \
     mkvtoolnix \
     ocl-icd-libopencl1 \
-    python3
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 FROM rust:slim-bullseye AS rustBuild
 WORKDIR /sav1n
