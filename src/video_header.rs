@@ -48,7 +48,7 @@ impl VideoHeader {
             ColorSpaceType::C410 => (pixels * 5) / 4, // 10 bits?
             ColorSpaceType::C411 => (pixels * 3) / 2, // 12 bits
             ColorSpaceType::C420p10 => pixels * 3,    // 10 bits
-            ColorSpaceType::C420 => (pixels * 3) / 2,       // 10 bits
+            ColorSpaceType::C420 => (pixels * 3) / 2, // 10 bits
             ColorSpaceType::C422 => pixels * 2,       // 16 bits
             ColorSpaceType::C440 => pixels * 2,       // 16 bits?
             ColorSpaceType::C444 => pixels * 3,       // 24 bits

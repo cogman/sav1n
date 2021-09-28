@@ -185,7 +185,8 @@ pub mod aom {
                 min_second_ref_usage_thresh + second_ref_usage_thresh_max_delta
             } else {
                 min_second_ref_usage_thresh
-                    + (frame_count_so_far as f64 / (adapt_upto - 1) as f64) * second_ref_usage_thresh_max_delta
+                    + (frame_count_so_far as f64 / (adapt_upto - 1) as f64)
+                        * second_ref_usage_thresh_max_delta
             }
         }
 
@@ -203,7 +204,7 @@ pub mod aom {
             last_stats: &AomFirstpass,
             future_frames: &VecDeque<AomFirstpass>,
             frame_since_last_scene: u64,
-            num_mbs: u32
+            num_mbs: u32,
         ) -> bool {
             let next_stats = future_frames[0];
 
@@ -211,7 +212,7 @@ pub mod aom {
             let pcnt_intra = 1.0 - self.pcnt_inter;
             let modified_pcnt_inter = self.pcnt_inter - self.pcnt_neutral;
             let second_ref_usage_thresh = Self::second_ref_usage_thresh(frame_since_last_scene);
-            let frames_to_test_after_candidate_key  = 16;
+            let frames_to_test_after_candidate_key = 16;
             let count_for_tolerable_prediction = 3;
 
             if frame_since_last_scene >= 3
@@ -237,8 +238,10 @@ pub mod aom {
                 let mut old_boost_score = 0.0;
                 let mut decay_accumulator = 1.0;
                 let mut j = 0;
-                for (i, local_next_frame) in
-                    future_frames.iter().enumerate().take(frames_to_test_after_candidate_key)
+                for (i, local_next_frame) in future_frames
+                    .iter()
+                    .enumerate()
+                    .take(frames_to_test_after_candidate_key)
                 {
                     j = i + 1;
                     let mut next_iiratio = Self::BOOST_FACTOR * local_next_frame.intra_error
