@@ -3,6 +3,8 @@ FROM debian:bullseye-slim AS runtime
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu/:/usr/local/lib/vapoursynth
 
 RUN apt-get update && apt-get install -y \
+    alien \
+    clinfo \
     libass9 \
     libfftw3-bin \
     libpython3.9 \
