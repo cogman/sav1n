@@ -1,7 +1,7 @@
 from vapoursynth import core
 import vapoursynth as vs
 
-print(core.std.LoadPlugin('libknlmeanscl.so'))
+#print(core.std.LoadPlugin('libknlmeanscl.so'))
 
 clip = core.lsmas.LWLibavSource(file)
 

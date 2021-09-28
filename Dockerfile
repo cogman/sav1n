@@ -374,5 +374,7 @@ COPY --from=rustBuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
 ENV PYTHONPATH=/usr/local/lib/python3.9/site-packages
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 WORKDIR /video
 ENTRYPOINT ["sav1n"]
