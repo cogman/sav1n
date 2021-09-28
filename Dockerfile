@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libva-drm2 \
     libxcb1 \
     mkvtoolnix \
+    ocl-icd-libopencl1 \
     python3
 
 FROM rust:slim-bullseye AS rustBuild
