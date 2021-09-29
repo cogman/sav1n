@@ -374,6 +374,8 @@ COPY --from=rustBuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
 ENV PYTHONPATH=/usr/local/lib/python3.9/site-packages
+RUN /bin/sh -c mkdir -p /etc/OpenCL/vendors && \
+    echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 WORKDIR /video

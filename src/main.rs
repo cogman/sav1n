@@ -165,6 +165,8 @@ fn encode_audio(i: String) -> JoinHandle<Child> {
             .arg("128k")
             .arg("-vbr")
             .arg("on")
+            .arg("-af")
+            .arg("channelmap=channel_layout=5.1")
             .arg("/tmp/audio.mkv")
             .spawn().unwrap()
     })
