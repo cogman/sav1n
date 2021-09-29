@@ -381,17 +381,20 @@ async fn vmaf_secant_search(
         fx2 = fx1;
         if next < min {
             if x1 == min {
+                // We already tried min.  No reason to try again.
                 break;
             } else {
                 next = min
             }
         } else if next > max {
             if x1 == max {
+                // We already tried max, don't try it again.
                 break;
             } else {
                 next = max
             }
         } else if next == x1 {
+            // We are so close that the next guess ends up being the current guess, just jump out
             break;
         }
         x1 = next;
