@@ -374,36 +374,31 @@ async fn vmaf_secant_search(
     while fx1.abs() > 0.005 && iterations < 10 {
         let mut next = (x1 as f64 - (fx1 * ((x1 as f64 - x2 as f64) / (fx1 - fx2)))).floor() as u32;
         println!(
-            "x1: {}, x2: {}, fx1: {}, fx2: {}, next: {}  ",
-            x1, x2, fx1, fx2, next
+            "{}({}): {}:{} {}:{} -> {}",
+            scene_number, iterations, x1, fx1 + target, x2, fx2 + target, next
         );
         x2 = x1;
         fx2 = fx1;
         if next < min {
             if x1 == min {
-                println!("Bailing out min");
-                return min;
+                break;
             } else {
                 next = min
             }
         } else if next > max {
             if x1 == max {
-                println!("Bailing out max");
-                return max;
+                break;
             } else {
                 next = max
             }
         } else if next == x1 {
-            println!("Bailing out, next check the same");
             break;
         }
         x1 = next;
         fx1 = vmaf_second_pass(scene_number, x1).await - target;
-
-        println!("tried cq: {}, got {} ", next, fx1 + target);
         iterations += 1;
     }
-    println!("final cq: {} final vmaf: {} ", x1, fx1 + target);
+    println!("{}: {}:{}", scene_number, x1, fx1 + target);
     return if fx1 > 0.0 { x1 } else { (x1 - 1).max(min) };
 }
 
