@@ -321,7 +321,7 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
         .arg(format!("--fpf={}.log", scene_str))
         .arg("--end-usage=q")
         .arg("--ivf")
-        .arg("--cpu-used=6")
+        .arg("--cpu-used=3")
         .arg("--threads=1")
         .arg("-o")
         .arg("-")
