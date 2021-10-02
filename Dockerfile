@@ -361,6 +361,7 @@ COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin/
 COPY --from=vmaf /vmaf/vmaf-2.1.1/model/vmaf_v0.6.1.json /usr/local/share/model/
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/
+COPY --from=ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
 COPY --from=ffmpeg /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=ffmpeg /usr/local/lib/x86_64-linux-gnu/*.so* /usr/local/lib/x86_64-linux-gnu/
 COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/python3.9/site-packages/

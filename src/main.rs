@@ -10,6 +10,7 @@ use crate::video_header::VideoHeader;
 use clap::{App, Arg, ArgMatches};
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde_json::Value;
 use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::convert::TryInto;
@@ -76,7 +77,7 @@ async fn main() {
         let scenes = vpx_processing.await.unwrap();
         aom_first_pass_scene.await.unwrap();
         frame_stats_processor.await.unwrap();
-        audio_processing.await.unwrap().wait().await;
+        audio_processing.await.unwrap();
         let encode_list = active_encodes.lock().await;
         let mut encode_len = encode_list.len();
         drop(encode_list);
@@ -139,8 +140,7 @@ async fn main() {
                 .unwrap()
                 .wait()
                 .await;
-        }
-        else {
+        } else {
             Command::new("ffmpeg")
                 .arg("-i")
                 .arg("/tmp/video.mkv")
@@ -163,9 +163,27 @@ async fn main() {
     }
 }
 
-fn encode_audio(i: String) -> JoinHandle<Child> {
+fn encode_audio(i: String) -> JoinHandle<()> {
     task::spawn(async move {
-        Command::new("ffmpeg")
+        let probe_results = Command::new("ffprobe")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .arg("-hide_banner")
+            .arg("-print_format")
+            .arg("json")
+            .arg("-show_streams")
+            .arg(&i)
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+
+        let probe_result: Value = serde_json::from_slice(&probe_results.stdout).unwrap();
+        let streams = probe_result["streams"].as_array().unwrap();
+
+        let mut audio_encode = Command::new("ffmpeg");
+        let mut next_section = audio_encode
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .arg("-i")
@@ -175,16 +193,44 @@ fn encode_audio(i: String) -> JoinHandle<Child> {
             .arg("-vn")
             .arg("-c:a")
             .arg("libopus")
-            .arg("-b:a")
-            .arg("128K")
             .arg("-vbr")
-            .arg("on")
-            .arg("-af")
-            .arg("channelmap=channel_layout=5.1")
+            .arg("on");
+        let mut channel_map = Vec::new();
+        let mut audio_index = 0;
+        for (i, stream) in streams.iter().enumerate() {
+            if stream["codec_type"] == "audio" {
+                let mut channel_layout = stream["channel_layout"].as_str().unwrap();
+                if channel_layout.ends_with("(side)") {
+                    let len = channel_layout.len();
+                    channel_layout = &channel_layout[0..len - "(side)".len()];
+                }
+                channel_map.push(format!(
+                    "[:{}]channelmap=channel_layout='{}'",
+                    i, channel_layout
+                ));
+                let channels = stream["channels"].as_u64().unwrap();
+                let bitrate = if channels < 5 {
+                    "64K"
+                } else if channels < 7 {
+                    "128K"
+                } else {
+                    "192K"
+                };
+                next_section = next_section
+                    .arg(format!("-b:a:{}", audio_index))
+                    .arg(bitrate);
+                audio_index += 1;
+            }
+        }
+        let mut child = next_section
+            .arg("-filter_complex")
+            .arg(format!("{}", channel_map.join(";")))
             .arg("-c:s")
             .arg("copy")
             .arg("/tmp/audio.mkv")
-            .spawn().unwrap()
+            .spawn()
+            .unwrap();
+        child.wait().await.unwrap();
     })
 }
 
@@ -379,15 +425,32 @@ async fn vmaf_secant_search(
     let mut x2 = initial_guess_max;
     let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1).await });
     let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2).await });
-    let (mut fx1_result, mut fx2_result) = join!(first_fx1, first_fx2);
-    let mut fx1 = fx1_result.unwrap() - target;
-    let mut fx2 = fx2_result.unwrap() - target;
+    let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
+    let fx1_target = fx1_result.unwrap() - target;
+    let mut fx1 = fx1_target;
+    let mut fx2 = &fx2_result.unwrap() - target;
+    // If vmaf for the second value is greater then the target, then we want it pinned so future guess aren't lower than this first high guess.
+    // For example, if the guess is 40 with vmaf of 99 and a target of 95, a guess of 60 might return 80, which would make the next guess less than 40 (since it falls off naturally as a result of secant searching)
+    // This swap keeps the 40 for the next pass which will make the next guess > 40.
+    // This only applies to the first pass as subsequent guesses should always narrow into the right result.
+    if fx2 > 0.0 {
+        fx1 = fx2;
+        x1 = x2;
+        fx2 = fx1_target;
+        x2 = initial_guess_min;
+    }
     let mut iterations = 0;
     while fx1.abs() > 0.005 && iterations < 10 {
         let mut next = (x1 as f64 - (fx1 * ((x1 as f64 - x2 as f64) / (fx1 - fx2)))).floor() as u32;
         println!(
             "{}({}): {}:{} {}:{} -> {}",
-            scene_number, iterations, x1, fx1 + target, x2, fx2 + target, next
+            scene_number,
+            iterations,
+            x1,
+            fx1 + target,
+            x2,
+            fx2 + target,
+            next
         );
         x2 = x1;
         fx2 = fx1;
