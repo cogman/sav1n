@@ -336,7 +336,7 @@ async fn second_pass(scene_number: u32, cq: u32) -> Child {
         .arg("--lag-in-frames=25")
         .arg("--kf-max-dist=250")
         .arg("--auto-alt-ref=1")
-        .arg("--arnr-strength=2")
+        .arg("--arnr-strength=1")
         .arg("--arnr-maxframes=7")
         .arg("--enable-tpl=1")
         .arg("--threads=1")
