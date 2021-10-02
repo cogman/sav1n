@@ -96,6 +96,7 @@ async fn main() {
         drop(concat_file);
 
         Command::new("ffmpeg")
+            .arg("-y")
             .arg("-f")
             .arg("concat")
             .arg("-safe")
@@ -109,9 +110,11 @@ async fn main() {
             .unwrap()
             .wait()
             .await;
-
+        let input_path = Path::new(&input);
+        let output_name = String::from(input_path.with_extension("new.mkv").file_name().unwrap().to_str().unwrap());
         if Path::new("/tmp/timecodes.txt").exists() {
             Command::new("ffmpeg")
+                .arg("-y")
                 .arg("-i")
                 .arg("/tmp/video.mkv")
                 .arg("-i")
@@ -132,7 +135,7 @@ async fn main() {
 
             Command::new("mkvmerge")
                 .arg("--output")
-                .arg("output.mkv")
+                .arg(output_name)
                 .arg("--timestamps")
                 .arg("0:/tmp/timecodes.txt")
                 .arg("/tmp/audiovideo.mkv")
@@ -142,6 +145,7 @@ async fn main() {
                 .await;
         } else {
             Command::new("ffmpeg")
+                .arg("-y")
                 .arg("-i")
                 .arg("/tmp/video.mkv")
                 .arg("-i")
@@ -154,7 +158,7 @@ async fn main() {
                 .arg("1:s?")
                 .arg("-c")
                 .arg("copy")
-                .arg("output.mkv")
+                .arg(output_name)
                 .spawn()
                 .unwrap()
                 .wait()
@@ -186,6 +190,7 @@ fn encode_audio(i: String) -> JoinHandle<()> {
         let mut next_section = audio_encode
             .stderr(Stdio::null())
             .stdout(Stdio::null())
+            .arg("-y")
             .arg("-i")
             .arg(i)
             .arg("-map")
@@ -387,6 +392,7 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
         .stdin(vpx_stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .arg("-y")
         .arg("-i")
         .arg("pipe:0")
         .arg("-i")
@@ -433,7 +439,7 @@ async fn vmaf_secant_search(
     // For example, if the guess is 40 with vmaf of 99 and a target of 95, a guess of 60 might return 80, which would make the next guess less than 40 (since it falls off naturally as a result of secant searching)
     // This swap keeps the 40 for the next pass which will make the next guess > 40.
     // This only applies to the first pass as subsequent guesses should always narrow into the right result.
-    if fx2 > 0.0 {
+    if fx2.abs() < fx1.abs() {
         fx1 = fx2;
         x1 = x2;
         fx2 = fx1_target;
