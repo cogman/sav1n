@@ -254,6 +254,7 @@ fn vpx_process(
         let mut file = File::create(format!("/tmp/{:06}.y4m", scene))
             .await
             .unwrap();
+        let mut prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         vpx_header.clone().write(&mut file).await;
         while let Ok(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
@@ -270,7 +271,7 @@ fn vpx_process(
                 let mut guard = active_encodes_vpx.lock().await;
                 guard.push(scene);
                 drop(guard);
-                compress_scene(scene, active_encodes_vpx.clone(), vmaf_target);
+                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target);
                 scene += 1;
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
@@ -289,16 +290,35 @@ fn vpx_process(
         let mut guard = active_encodes_vpx.lock().await;
         guard.push(scene);
         drop(guard);
-        compress_scene(scene, active_encodes_vpx.clone(), vmaf_target);
+        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target);
         scene
     })
 }
 
-fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
+fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut first_pass = first_pass(scene_number).await;
         first_pass.wait().await.unwrap();
-        let cq = vmaf_secant_search(10, 60, 20, 40, vmaf_target, scene_number).await;
+        let mut initial_min = 20;
+        let mut initial_max = 40;
+        {
+            let mut guard = prior_cq_values.lock().await;
+            if guard.len() >= 10 {
+                let sample_point = guard.len() / 10;
+                if guard[sample_point] != guard[guard.len() - sample_point - 1] {
+                    initial_min = guard[sample_point];
+                    initial_max = guard[guard.len() - sample_point - 1];
+                }
+            }
+            drop(guard);
+        }
+        let cq = vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number).await;
+        {
+            let mut guard = prior_cq_values.lock().await;
+            let insertion_index = guard.binary_search(&cq).unwrap_or_else(|x| x);
+            guard.insert(insertion_index, cq);
+            drop(guard);
+        }
         second_pass(scene_number, cq).await.wait().await.unwrap();
         cleanup(scene_number).await;
         let mut encodes = encoding_scenes.lock().await;
