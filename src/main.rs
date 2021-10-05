@@ -37,6 +37,7 @@ async fn main() {
         let i = String::from(input);
         let encoders = options.value_of_t_or_exit("encoders");
         let vpy: String = options.value_of_t_or_exit("vpy");
+        let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
 
         let audio_processing = encode_audio(i);
 
@@ -63,6 +64,7 @@ async fn main() {
             header.clone(),
             active_encodes.clone(),
             encoders,
+            vmaf_target,
         );
 
         let aom_first_pass_scene =
@@ -245,6 +247,7 @@ fn vpx_process(
     vpx_header: VideoHeader,
     active_encodes_vpx: Arc<Mutex<Vec<u32>>>,
     encoders: usize,
+    vmaf_target: f64,
 ) -> JoinHandle<u32> {
     task::spawn(async move {
         let mut scene: u32 = 0;
@@ -267,7 +270,7 @@ fn vpx_process(
                 let mut guard = active_encodes_vpx.lock().await;
                 guard.push(scene);
                 drop(guard);
-                compress_scene(scene, active_encodes_vpx.clone());
+                compress_scene(scene, active_encodes_vpx.clone(), vmaf_target);
                 scene += 1;
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
@@ -286,16 +289,16 @@ fn vpx_process(
         let mut guard = active_encodes_vpx.lock().await;
         guard.push(scene);
         drop(guard);
-        compress_scene(scene, active_encodes_vpx.clone());
+        compress_scene(scene, active_encodes_vpx.clone(), vmaf_target);
         scene
     })
 }
 
-fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>) -> JoinHandle<()> {
+fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut first_pass = first_pass(scene_number).await;
         first_pass.wait().await.unwrap();
-        let cq = vmaf_secant_search(10, 60, 20, 40, 0.95, scene_number).await;
+        let cq = vmaf_secant_search(10, 60, 20, 40, vmaf_target, scene_number).await;
         second_pass(scene_number, cq).await.wait().await.unwrap();
         cleanup(scene_number).await;
         let mut encodes = encoding_scenes.lock().await;
@@ -512,7 +515,7 @@ fn stats_processor(
         let num_mbs = mbs(video_header.width, video_header.height);
         loop {
             delayed_aom.acquire().await.unwrap().forget();
-            if current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs) {
+            if since_last_keyframe >= 1000 || current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs) {
                 stats_tx.send(FrameStats {
                     frame_num: current.frame as u64,
                     is_keyframe: true,
@@ -645,6 +648,14 @@ fn extract_options() -> ArgMatches {
                 .default_value("12")
                 .multiple_values(false)
                 .takes_value(true),
+        )
+        .arg(
+            Arg::new("vmaf_target")
+                .short('t')
+                .long("vmaf_target")
+                .default_value("95")
+                .multiple_values(false)
+                .takes_value(true)
         )
         .get_matches()
 }

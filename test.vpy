@@ -2,6 +2,7 @@ from vapoursynth import core
 import vapoursynth as vs
 
 #print(core.std.LoadPlugin('libknlmeanscl.so'))
+core.std.LoadPlugin('/usr/local/lib/vapoursynth/libmiscfilters.so')
 
 clip = core.lsmas.LWLibavSource(file)
 
