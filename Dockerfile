@@ -214,10 +214,10 @@ WORKDIR /znedi3
 RUN make
 
 FROM vapoursynth AS HAvsFunc
-RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b mod /adjust
+RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
 RUN mv /adjust/adjust.py /usr/local/lib/python3.9/site-packages
 
-RUN git clone https://github.com/AmusementClub/mvsfunc.git --depth=1 -b master /mvsfunc
+RUN git clone https://github.com/AmusementClub/mvsfunc.git --depth=1 -b mod /mvsfunc
 RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.9/site-packages
 
 RUN git clone https://github.com/mawen1250/VapourSynth-script.git --depth=1 -b master /nnedi3_resample
