@@ -73,7 +73,7 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R57-RC1 /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R57 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -82,9 +82,15 @@ RUN ./autogen.sh && \
 
 FROM vapoursynth AS miscFilters
 RUN git clone https://github.com/vapoursynth/vs-miscfilters-obsolete.git -b master /vs-misc
-WORKDIR /vs-misc/src
-COPY --from=vapoursynth /vapoursynth/build/src/core/filtershared.h /vs-misc/src
-RUN  g++ -O3 -fpic -shared -I/usr/local/include/vapoursynth miscfilters.cpp -o libmiscfilters.so
+WORKDIR /vs-misc
+RUN meson build && \
+    ninja -C build
+
+FROM vapoursynth AS vivtc
+RUN git clone https://github.com/vapoursynth/vivtc.git -b master /vivtc
+WORKDIR /vivtc
+RUN meson build && \
+    ninja -C build
 
 FROM vapoursynth AS addGrain
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-AddGrain.git --depth=1 -b master /addgrain
@@ -376,7 +382,8 @@ COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/*.py /usr/local/lib/python3.9/site-packages/
 COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=nnedi3 /nnedi3/src/nnedi3_weights.bin /usr/local/share/nnedi3/
-COPY --from=miscFilters /vs-misc/src/libmiscfilters.so /usr/local/lib/vapoursynth/
+COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
+COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
