@@ -614,7 +614,7 @@ fn start_aom_scene_detection() -> Child {
         .arg("--bit-depth=10")
         .arg("--fpf=/tmp/keyframe.log")
         .arg("--end-usage=q")
-        .arg("--threads=1")
+        .arg("--threads=4")
         .arg("-o")
         .arg("/dev/null")
         .arg("-")
