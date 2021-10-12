@@ -216,16 +216,10 @@ fn encode_audio(i: String) -> JoinHandle<()> {
                     i, channel_layout
                 ));
                 let channels = stream["channels"].as_u64().unwrap();
-                let bitrate = if channels < 5 {
-                    "64K"
-                } else if channels < 7 {
-                    "128K"
-                } else {
-                    "192K"
-                };
+                let bitrate = channels * 42;
                 next_section = next_section
                     .arg(format!("-b:a:{}", audio_index))
-                    .arg(bitrate);
+                    .arg(format!("{}K", bitrate));
                 audio_index += 1;
             }
         }
