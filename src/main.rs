@@ -11,10 +11,10 @@ use clap::{App, Arg, ArgMatches};
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::Value;
-use std::borrow::Borrow;
+
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::ops::{BitAnd, BitXor, Not};
+use std::ops::{BitAnd, Not};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,9 +22,9 @@ use tokio::fs::remove_file;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
 use tokio::join;
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::broadcast::{Receiver, Sender};
-use tokio::sync::{broadcast, watch, Mutex, MutexGuard, Semaphore};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
@@ -53,7 +53,7 @@ async fn main() {
         let buffer = Arc::new(FrameBuffer::new(129, header.clone()));
 
         let delayed_aom = analyzed_aom_frames.clone();
-        let (stats_tx, mut stats_rx) = broadcast::channel(129);
+        let (stats_tx, stats_rx) = broadcast::channel(129);
 
         let frame_stats_processor = stats_processor(header.clone(), delayed_aom, stats_tx);
 
@@ -91,10 +91,10 @@ async fn main() {
         let mut concat_file = File::create("/tmp/concat.txt").await.unwrap();
         for scene in 0..=scenes {
             let concat_line = format!("file '/tmp/{:06}.ivf'\n", scene);
-            concat_file.write_all(concat_line.as_bytes()).await;
+            concat_file.write_all(concat_line.as_bytes()).await.unwrap();
         }
-        concat_file.flush();
-        concat_file.shutdown();
+        concat_file.flush().await.unwrap();
+        concat_file.shutdown().await.unwrap();
         drop(concat_file);
 
         Command::new("ffmpeg")
@@ -111,7 +111,8 @@ async fn main() {
             .spawn()
             .unwrap()
             .wait()
-            .await;
+            .await
+            .unwrap();
         let input_path = Path::new(&input);
         let output_name = String::from(input_path.with_extension("new.mkv").file_name().unwrap().to_str().unwrap());
         if Path::new("/tmp/timecodes.txt").exists() {
@@ -133,7 +134,8 @@ async fn main() {
                 .spawn()
                 .unwrap()
                 .wait()
-                .await;
+                .await
+                .unwrap();
 
             Command::new("mkvmerge")
                 .arg("--output")
@@ -144,7 +146,8 @@ async fn main() {
                 .spawn()
                 .unwrap()
                 .wait()
-                .await;
+                .await
+                .unwrap();
         } else {
             Command::new("ffmpeg")
                 .arg("-y")
@@ -164,7 +167,8 @@ async fn main() {
                 .spawn()
                 .unwrap()
                 .wait()
-                .await;
+                .await
+                .unwrap();
         }
     }
 }
@@ -225,7 +229,7 @@ fn encode_audio(i: String) -> JoinHandle<()> {
         }
         let mut child = next_section
             .arg("-filter_complex")
-            .arg(format!("{}", channel_map.join(";")))
+            .arg(channel_map.join(";"))
             .arg("-c:s")
             .arg("copy")
             .arg("/tmp/audio.mkv")
@@ -248,12 +252,12 @@ fn vpx_process(
         let mut file = File::create(format!("/tmp/{:06}.y4m", scene))
             .await
             .unwrap();
-        let mut prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-        vpx_header.clone().write(&mut file).await;
+        let prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        vpx_header.clone().write(&mut file).await.unwrap();
         while let Ok(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
-                file.flush().await;
-                file.shutdown().await;
+                file.flush().await.unwrap();
+                file.shutdown().await.unwrap();
                 drop(file);
                 let encode_list = active_encodes_vpx.lock().await;
                 let mut encode_len = encode_list.len();
@@ -270,13 +274,13 @@ fn vpx_process(
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
                     .unwrap();
-                vpx_header.clone().write(&mut file).await;
+                vpx_header.clone().write(&mut file).await.unwrap();
             }
             let frame = scene_buffer.get_frame(stat.frame_num).await;
             if let Some(frame_data) = frame {
                 assert_eq!(stat.frame_num, frame_data.num);
-                frame_data.write(&mut file).await;
-                scene_buffer.pop().await;
+                frame_data.write(&mut file).await.unwrap();
+                scene_buffer.pop().await.unwrap();
             } else {
                 break;
             }
@@ -296,7 +300,7 @@ fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, prio
         let mut initial_min = 20;
         let mut initial_max = 40;
         {
-            let mut guard = prior_cq_values.lock().await;
+            let guard = prior_cq_values.lock().await;
             if guard.len() >= 10 {
                 let sample_point = guard.len() / 10;
                 if guard[sample_point] != guard[guard.len() - sample_point - 1] {
@@ -373,7 +377,9 @@ async fn cleanup(scene_number: u32) {
     let scene_str = format!("/tmp/{:06}", scene_number);
     let remove_video = remove_file(format!("{}.y4m", scene_str));
     let remove_scene = remove_file(format!("{}.log", scene_str));
-    join!(remove_video, remove_scene);
+    let (video, scene) = join!(remove_video, remove_scene);
+    video.unwrap();
+    scene.unwrap();
 }
 
 async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
@@ -398,14 +404,14 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
         .spawn()
         .unwrap();
 
-    let mut vpx_stdin: Stdio = vpx
+    let vpx_stdin: Stdio = vpx
         .stdout
         .take()
         .unwrap()
         .try_into()
         .expect("failed to convert to Stdio");
 
-    let mut ffmpeg = Command::new("ffmpeg")
+    let ffmpeg = Command::new("ffmpeg")
         .stdin(vpx_stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -451,7 +457,7 @@ async fn vmaf_secant_search(
     let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
     let fx1_target = fx1_result.unwrap() - target;
     let mut fx1 = fx1_target;
-    let mut fx2 = &fx2_result.unwrap() - target;
+    let mut fx2 = fx2_result.unwrap() - target;
     // If vmaf for the second value is greater then the target, then we want it pinned so future guess aren't lower than this first high guess.
     // For example, if the guess is 40 with vmaf of 99 and a target of 95, a guess of 60 might return 80, which would make the next guess less than 40 (since it falls off naturally as a result of secant searching)
     // This swap keeps the 40 for the next pass which will make the next guess > 40.
@@ -500,7 +506,7 @@ async fn vmaf_secant_search(
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
-    return if fx1 > 0.0 { x1 } else { (x1 - 1).max(min) };
+    if fx1 > 0.0 { x1 } else { (x1 - 1).max(min) }
 }
 
 fn stats_processor(
@@ -508,7 +514,8 @@ fn stats_processor(
     delayed_aom: Arc<Semaphore>,
     stats_tx: Sender<FrameStats>,
 ) -> JoinHandle<()> {
-    let frame_stats_processor = task::spawn(async move {
+    
+    task::spawn(async move {
         delayed_aom.acquire_many(96).await.unwrap().forget();
         let mut frame_stats = VecDeque::new();
         let mut keyframe =
@@ -567,8 +574,7 @@ fn stats_processor(
                 }
             }
         }
-    });
-    frame_stats_processor
+    })
 }
 
 fn aom_firstpass_for_scene_detection(
@@ -683,13 +689,13 @@ fn mbs(width: u32, height: u32) -> u32 {
 
     let mb_cols = (mi_cols + 2) >> 2;
     let mb_rows = (mi_rows + 2) >> 2;
-    return (mb_rows * mb_cols) as u32;
+    (mb_rows * mb_cols) as u32
 }
 
 fn align_power_of_two(value: i32, n: i32) -> i32 {
     let x = value + ((1 << n) - 1);
     let y = ((1 << n) - 1).not();
-    return x.bitand(y);
+    x.bitand(y)
 }
 
 #[derive(Clone)]
