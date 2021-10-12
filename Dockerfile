@@ -73,7 +73,7 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b master /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R57-RC1 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -217,7 +217,7 @@ FROM vapoursynth AS HAvsFunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
 RUN mv /adjust/adjust.py /usr/local/lib/python3.9/site-packages
 
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/mvsfunc.git --depth=1 -b master /mvsfunc
+RUN git clone https://github.com/AmusementClub/mvsfunc.git --depth=1 -b mod /mvsfunc
 RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.9/site-packages
 
 RUN git clone https://github.com/mawen1250/VapourSynth-script.git --depth=1 -b master /nnedi3_resample
