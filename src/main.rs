@@ -27,7 +27,6 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() {
@@ -39,7 +38,8 @@ async fn main() {
         let vpy: String = options.value_of_t_or_exit("vpy");
         let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
 
-        let audio_processing = encode_audio(i);
+        let active_encodes = Arc::new(Semaphore::new(encoders));
+        let audio_processing = encode_audio(i, active_encodes.clone());
 
         let mut vspipe = start_vspipe(input, vpy.as_str());
 
@@ -57,13 +57,11 @@ async fn main() {
 
         let frame_stats_processor = stats_processor(header.clone(), delayed_aom, stats_tx);
 
-        let active_encodes = Arc::new(Mutex::new(Vec::new()));
         let vpx_processing = vpx_process(
             stats_rx,
             buffer.clone(),
             header.clone(),
             active_encodes.clone(),
-            encoders,
             vmaf_target,
         );
 
@@ -80,13 +78,7 @@ async fn main() {
         aom_first_pass_scene.await.unwrap();
         frame_stats_processor.await.unwrap();
         audio_processing.await.unwrap();
-        let encode_list = active_encodes.lock().await;
-        let mut encode_len = encode_list.len();
-        drop(encode_list);
-        while encode_len > 0 {
-            sleep(Duration::from_millis(500)).await;
-            encode_len = active_encodes.lock().await.len();
-        }
+        active_encodes.acquire_many(encoders as u32).await.unwrap();
 
         let mut concat_file = File::create("/tmp/concat.txt").await.unwrap();
         for scene in 0..=scenes {
@@ -173,8 +165,9 @@ async fn main() {
     }
 }
 
-fn encode_audio(i: String) -> JoinHandle<()> {
+fn encode_audio(i: String, permits: Arc<Semaphore>) -> JoinHandle<()> {
     task::spawn(async move {
+        permits.acquire().await.unwrap().forget();
         let probe_results = Command::new("ffprobe")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -236,6 +229,7 @@ fn encode_audio(i: String) -> JoinHandle<()> {
             .spawn()
             .unwrap();
         child.wait().await.unwrap();
+        permits.add_permits(1);
     })
 }
 
@@ -243,8 +237,7 @@ fn vpx_process(
     mut stats_rx: Receiver<FrameStats>,
     scene_buffer: Arc<FrameBuffer>,
     vpx_header: VideoHeader,
-    active_encodes_vpx: Arc<Mutex<Vec<u32>>>,
-    encoders: usize,
+    active_encodes_vpx: Arc<Semaphore>,
     vmaf_target: f64,
 ) -> JoinHandle<u32> {
     task::spawn(async move {
@@ -259,17 +252,7 @@ fn vpx_process(
                 file.flush().await.unwrap();
                 file.shutdown().await.unwrap();
                 drop(file);
-                let encode_list = active_encodes_vpx.lock().await;
-                let mut encode_len = encode_list.len();
-                drop(encode_list);
-                while encode_len > encoders {
-                    sleep(Duration::from_millis(500)).await;
-                    encode_len = active_encodes_vpx.lock().await.len();
-                }
-                let mut guard = active_encodes_vpx.lock().await;
-                guard.push(scene);
-                drop(guard);
-                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target);
+                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target).await;
                 scene += 1;
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
@@ -285,15 +268,13 @@ fn vpx_process(
                 break;
             }
         }
-        let mut guard = active_encodes_vpx.lock().await;
-        guard.push(scene);
-        drop(guard);
-        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target);
+        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target).await;
         scene
     })
 }
 
-fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
+async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
+    encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
         let mut first_pass = first_pass(scene_number).await;
         first_pass.wait().await.unwrap();
@@ -311,6 +292,7 @@ fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, prio
             drop(guard);
         }
         let cq = vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number).await;
+        encoding_scenes.add_permits(1);
         {
             let mut guard = prior_cq_values.lock().await;
             let insertion_index = guard.binary_search(&cq).unwrap_or_else(|x| x);
@@ -318,10 +300,8 @@ fn compress_scene(scene_number: u32, encoding_scenes: Arc<Mutex<Vec<u32>>>, prio
             drop(guard);
         }
         second_pass(scene_number, cq).await.wait().await.unwrap();
+        encoding_scenes.add_permits(1);
         cleanup(scene_number).await;
-        let mut encodes = encoding_scenes.lock().await;
-        let index = encodes.binary_search(&scene_number).unwrap();
-        encodes.remove(index);
     })
 }
 
