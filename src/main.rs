@@ -362,7 +362,7 @@ async fn cleanup(scene_number: u32) {
     scene.unwrap();
 }
 
-async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
+async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32) -> f64 {
     let scene_str = format!("/tmp/{:06}", scene_number);
     let mut vpx = Command::new("vpxenc")
         .arg(format!("--cq-level={}", cq))
@@ -375,8 +375,10 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32) -> f64 {
         .arg(format!("--fpf={}.log", scene_str))
         .arg("--end-usage=q")
         .arg("--ivf")
-        .arg("--cpu-used=3")
-        .arg("--threads=1")
+        .arg(format!("--cpu-used={}", cpu_used))
+        .arg("--threads=2")
+        .arg("--row-mt=1")
+        .arg("--tile-columns=1")
         .arg("-o")
         .arg("-")
         .arg(format!("{}.y4m", scene_str))
@@ -432,8 +434,8 @@ async fn vmaf_secant_search(
 ) -> u32 {
     let mut x1 = initial_guess_min;
     let mut x2 = initial_guess_max;
-    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1).await });
-    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2).await });
+    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1, 6).await });
+    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2, 6).await });
     let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
     let fx1_target = fx1_result.unwrap() - target;
     let mut fx1 = fx1_target;
@@ -482,7 +484,7 @@ async fn vmaf_secant_search(
             break;
         }
         x1 = next;
-        fx1 = vmaf_second_pass(scene_number, x1).await - target;
+        fx1 = vmaf_second_pass(scene_number, x1, 3).await - target;
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
