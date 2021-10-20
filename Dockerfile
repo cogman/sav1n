@@ -215,9 +215,12 @@ RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS znedi3
-RUN git clone --recursive https://github.com/sekrit-twc/znedi3 /znedi3
+RUN git clone https://github.com/sekrit-twc/znedi3.git /znedi3
 WORKDIR /znedi3
-RUN make
+RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
+    git submodule init && \
+    git submodule update --recursive 
+RUN make x86=1
 
 FROM vapoursynth AS HAvsFunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
