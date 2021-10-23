@@ -35,6 +35,7 @@ async fn main() {
     if let Some(input) = options.value_of("input") {
         let i = String::from(input);
         let encoders = options.value_of_t_or_exit("encoders");
+        let cpu_used = options.value_of_t_or_exit("cpu_used");
         let vpy: String = options.value_of_t_or_exit("vpy");
         let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
 
@@ -63,6 +64,7 @@ async fn main() {
             header.clone(),
             active_encodes.clone(),
             vmaf_target,
+            cpu_used,
         );
 
         let aom_first_pass_scene =
@@ -239,6 +241,7 @@ fn vpx_process(
     vpx_header: VideoHeader,
     active_encodes_vpx: Arc<Semaphore>,
     vmaf_target: f64,
+    cpu_used: u32,
 ) -> JoinHandle<u32> {
     task::spawn(async move {
         let mut scene: u32 = 0;
@@ -252,7 +255,7 @@ fn vpx_process(
                 file.flush().await.unwrap();
                 file.shutdown().await.unwrap();
                 drop(file);
-                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target).await;
+                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target, cpu_used).await;
                 scene += 1;
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
@@ -268,12 +271,12 @@ fn vpx_process(
                 break;
             }
         }
-        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target).await;
+        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target, cpu_used).await;
         scene
     })
 }
 
-async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64) -> JoinHandle<()> {
+async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64, cpu_used: u32) -> JoinHandle<()> {
     encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
         let mut first_pass = first_pass(scene_number).await;
@@ -299,7 +302,7 @@ async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prio
             guard.insert(insertion_index, cq);
             drop(guard);
         }
-        second_pass(scene_number, cq).await.wait().await.unwrap();
+        second_pass(scene_number, cq, cpu_used).await.wait().await.unwrap();
         encoding_scenes.add_permits(1);
         cleanup(scene_number).await;
     })
@@ -324,16 +327,17 @@ async fn first_pass(scene_number: u32) -> Child {
         .unwrap()
 }
 
-async fn second_pass(scene_number: u32, cq: u32) -> Child {
+async fn second_pass(scene_number: u32, cq: u32, cpu_used: u32) -> Child {
     let scene_str = format!("/tmp/{:06}", scene_number);
     Command::new("vpxenc")
         .arg(format!("--cq-level={}", cq))
+        .arg(format!("--cpu-used={}", cpu_used))
+        .arg(format!("--fpf={}.log", scene_str))
         .arg("--quiet")
         .arg("--passes=2")
         .arg("--pass=2")
         .arg("--profile=2")
         .arg("--good")
-        .arg("--cpu-used=0")
         .arg("--lag-in-frames=25")
         .arg("--kf-max-dist=250")
         .arg("--auto-alt-ref=1")
@@ -343,7 +347,6 @@ async fn second_pass(scene_number: u32, cq: u32) -> Child {
         .arg("--threads=1")
         .arg("-b")
         .arg("10")
-        .arg(format!("--fpf={}.log", scene_str))
         .arg("--end-usage=q")
         .arg("--ivf")
         .arg("-o")
@@ -364,19 +367,20 @@ async fn cleanup(scene_number: u32) {
 
 async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32) -> f64 {
     let scene_str = format!("/tmp/{:06}", scene_number);
+    let threads = if cpu_used > 3 { 1 } else { 2 };
     let mut vpx = Command::new("vpxenc")
         .arg(format!("--cq-level={}", cq))
+        .arg(format!("--cpu-used={}", cpu_used))
+        .arg(format!("--fpf={}.log", scene_str))
+        .arg(format!("--threads={}", threads))
         .arg("--quiet")
         .arg("--passes=2")
         .arg("--pass=2")
         .arg("--profile=2")
         .arg("-b")
         .arg("10")
-        .arg(format!("--fpf={}.log", scene_str))
         .arg("--end-usage=q")
         .arg("--ivf")
-        .arg(format!("--cpu-used={}", cpu_used))
-        .arg("--threads=2")
         .arg("--row-mt=1")
         .arg("--tile-columns=1")
         .arg("-o")
@@ -658,6 +662,14 @@ fn extract_options() -> ArgMatches {
                 .default_value("95")
                 .multiple_values(false)
                 .takes_value(true)
+        )
+        .arg(
+            Arg::new("cpu_used")
+                .short('c')
+                .long("cpu_used")
+                .default_value("0")
+                .multiple_values(false)
+                .takes_value(true),
         )
         .get_matches()
 }
