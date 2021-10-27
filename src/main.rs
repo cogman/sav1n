@@ -28,6 +28,11 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
 
+extern crate jemallocator;
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     let options = extract_options();
@@ -108,7 +113,14 @@ async fn main() {
             .await
             .unwrap();
         let input_path = Path::new(&input);
-        let output_name = String::from(input_path.with_extension("new.mkv").file_name().unwrap().to_str().unwrap());
+        let output_name = String::from(
+            input_path
+                .with_extension("new.mkv")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
         if Path::new("/tmp/timecodes.txt").exists() {
             Command::new("ffmpeg")
                 .arg("-y")
@@ -255,7 +267,14 @@ fn vpx_process(
                 file.flush().await.unwrap();
                 file.shutdown().await.unwrap();
                 drop(file);
-                compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target, cpu_used).await;
+                compress_scene(
+                    scene,
+                    active_encodes_vpx.clone(),
+                    prior_cq_values.clone(),
+                    vmaf_target,
+                    cpu_used,
+                )
+                .await;
                 scene += 1;
                 file = File::create(format!("/tmp/{:06}.y4m", scene))
                     .await
@@ -271,12 +290,25 @@ fn vpx_process(
                 break;
             }
         }
-        compress_scene(scene, active_encodes_vpx.clone(), prior_cq_values.clone(), vmaf_target, cpu_used).await;
+        compress_scene(
+            scene,
+            active_encodes_vpx.clone(),
+            prior_cq_values.clone(),
+            vmaf_target,
+            cpu_used,
+        )
+        .await;
         scene
     })
 }
 
-async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prior_cq_values: Arc<Mutex<Vec<u32>>>, vmaf_target: f64, cpu_used: u32) -> JoinHandle<()> {
+async fn compress_scene(
+    scene_number: u32,
+    encoding_scenes: Arc<Semaphore>,
+    prior_cq_values: Arc<Mutex<Vec<u32>>>,
+    vmaf_target: f64,
+    cpu_used: u32,
+) -> JoinHandle<()> {
     encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
         let mut first_pass = first_pass(scene_number).await;
@@ -294,7 +326,8 @@ async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prio
             }
             drop(guard);
         }
-        let cq = vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number).await;
+        let cq =
+            vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number).await;
         encoding_scenes.add_permits(1);
         {
             let mut guard = prior_cq_values.lock().await;
@@ -302,7 +335,11 @@ async fn compress_scene(scene_number: u32, encoding_scenes: Arc<Semaphore>, prio
             guard.insert(insertion_index, cq);
             drop(guard);
         }
-        second_pass(scene_number, cq, cpu_used).await.wait().await.unwrap();
+        second_pass(scene_number, cq, cpu_used)
+            .await
+            .wait()
+            .await
+            .unwrap();
         encoding_scenes.add_permits(1);
         cleanup(scene_number).await;
     })
@@ -492,7 +529,11 @@ async fn vmaf_secant_search(
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
-    if fx1 > 0.0 { x1 } else { (x1 - 1).max(min) }
+    if fx1 > 0.0 {
+        x1
+    } else {
+        (x1 - 1).max(min)
+    }
 }
 
 fn stats_processor(
@@ -500,7 +541,6 @@ fn stats_processor(
     delayed_aom: Arc<Semaphore>,
     stats_tx: Sender<FrameStats>,
 ) -> JoinHandle<()> {
-    
     task::spawn(async move {
         delayed_aom.acquire_many(96).await.unwrap().forget();
         let mut frame_stats = VecDeque::new();
@@ -522,7 +562,9 @@ fn stats_processor(
         let num_mbs = mbs(video_header.width, video_header.height);
         loop {
             delayed_aom.acquire().await.unwrap().forget();
-            if since_last_keyframe >= 1000 || current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs) {
+            if since_last_keyframe >= 1000
+                || current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs)
+            {
                 stats_tx.send(FrameStats {
                     frame_num: current.frame as u64,
                     is_keyframe: true,
@@ -661,7 +703,7 @@ fn extract_options() -> ArgMatches {
                 .long("vmaf_target")
                 .default_value("95")
                 .multiple_values(false)
-                .takes_value(true)
+                .takes_value(true),
         )
         .arg(
             Arg::new("cpu_used")
