@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y \
 
 FROM rust:slim-bullseye AS rustBuild
 WORKDIR /sav1n
-
+RUN apt-get update && apt-get install -y make fd-find && rm -rf /var/lib/apt/lists/*
 COPY src/ src/
 COPY Cargo.toml .
 COPY Cargo.lock .
