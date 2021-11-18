@@ -86,6 +86,12 @@ WORKDIR /vs-misc
 RUN meson build && \
     ninja -C build
 
+FROM vapoursynth AS removegrain
+RUN git clone https://github.com/vapoursynth/vs-removegrain.git -b master /vs-removegrain
+WORKDIR /removegrain
+RUN meson build && \
+    ninja -C build
+
 FROM vapoursynth AS vivtc
 RUN git clone https://github.com/vapoursynth/vivtc.git -b master /vivtc
 WORKDIR /vivtc
@@ -386,6 +392,7 @@ COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/*.py /usr/local/lib/
 COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=nnedi3 /nnedi3/src/nnedi3_weights.bin /usr/local/share/nnedi3/
 COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
+COPY --from=removegrain /removegrain/build/libremovegrain.so /usr/local/lib/vapoursynth/
 COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 
 COPY --from=rustBuild /sav1n/target/release/sav1n .
