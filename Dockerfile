@@ -87,7 +87,7 @@ RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS removegrain
-RUN git clone https://github.com/vapoursynth/vs-removegrain.git -b master /vs-removegrain
+RUN git clone https://github.com/vapoursynth/vs-removegrain.git -b master /removegrain
 WORKDIR /removegrain
 RUN meson build && \
     ninja -C build
