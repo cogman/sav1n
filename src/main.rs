@@ -285,7 +285,7 @@ fn vpx_process(
             if let Some(frame_data) = frame {
                 assert_eq!(stat.frame_num, frame_data.num);
                 frame_data.write(&mut file).await.unwrap();
-                scene_buffer.pop().await.unwrap();
+                scene_buffer.pop().await;
             } else {
                 break;
             }
