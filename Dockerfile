@@ -214,6 +214,12 @@ WORKDIR /sangnom
 RUN meson build && \
     ninja -C build
 
+FROM vapoursynth AS temporalsoften2
+RUN git clone https://github.com/dubhater/vapoursynth-temporalsoften2.git --depth=1 -b master /temporalsoften2
+WORKDIR /temporalsoften2
+RUN meson build && \
+    ninja -C build
+
 FROM vapoursynth AS ttempsmooth
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-TTempSmooth.git --depth=1 -b master /ttempsmooth
 WORKDIR /ttempsmooth
@@ -258,6 +264,7 @@ COPY --from=mvtools /mvtools/build/*.so /usr/local/lib/vapoursynth
 COPY --from=nnedi3 /nnedi3/.libs/*.so /usr/local/lib/vapoursynth
 COPY --from=nnedi3cl /nnedi3cl/build/*.so /usr/local/lib/vapoursynth
 COPY --from=sangnom /sangnom/build/*.so /usr/local/lib/vapoursynth
+COPY --from=temporalsoften2 /temporalsoften2/build/*.so /usr/local/lib/vapoursynth
 COPY --from=ttempsmooth /ttempsmooth/build/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/lib/vapoursynth

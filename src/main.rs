@@ -674,7 +674,7 @@ fn extract_options() -> ArgMatches {
             Arg::new("input")
                 .short('i')
                 .long("input")
-                .about("Input file")
+                .help("Input file")
                 .required(true)
                 .multiple_values(false)
                 .takes_value(true),
@@ -683,7 +683,7 @@ fn extract_options() -> ArgMatches {
             Arg::new("vpy")
                 .short('v')
                 .long("vpy")
-                .about("vapoursynth file")
+                .help("vapoursynth file")
                 .required(true)
                 .multiple_values(false)
                 .takes_value(true),
@@ -692,7 +692,7 @@ fn extract_options() -> ArgMatches {
             Arg::new("encoders")
                 .short('e')
                 .long("encoders")
-                .about("Number of encoders")
+                .help("Number of encoders")
                 .default_value("12")
                 .multiple_values(false)
                 .takes_value(true),
