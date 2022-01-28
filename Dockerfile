@@ -73,7 +73,7 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b master /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R57 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
