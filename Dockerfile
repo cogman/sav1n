@@ -372,7 +372,7 @@ RUN ./configure --enable-shared && \
     make && \
     make install
 
-RUN git clone https://github.com/HolyWu/L-SMASH-Works.git --depth 1 /lsmash-plugin && mkdir -p /lsmash-plugin/build-vapoursynth /lsmash-plugin/build-avisynth
+RUN git clone https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git --depth 1 /lsmash-plugin && mkdir -p /lsmash-plugin/build-vapoursynth /lsmash-plugin/build-avisynth
 WORKDIR /lsmash-plugin/build-vapoursynth
 RUN meson "../VapourSynth" && \
     ninja && \
