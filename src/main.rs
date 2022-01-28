@@ -200,12 +200,13 @@ fn encode_audio(i: String, permits: Arc<Semaphore>) -> JoinHandle<()> {
         let streams = probe_result["streams"].as_array().unwrap();
 
         let mut audio_encode = Command::new("ffmpeg");
+        let subtitles = if i.ends_with("mp4") { "srt" } else { "copy" };
         let mut next_section = audio_encode
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .arg("-y")
             .arg("-i")
-            .arg(i)
+            .arg(&i)
             .arg("-map")
             .arg("0")
             .arg("-vn")
@@ -238,7 +239,7 @@ fn encode_audio(i: String, permits: Arc<Semaphore>) -> JoinHandle<()> {
             .arg("-filter_complex")
             .arg(channel_map.join(";"))
             .arg("-c:s")
-            .arg("copy")
+            .arg(subtitles)
             .arg("/tmp/audio.mkv")
             .spawn()
             .unwrap();
