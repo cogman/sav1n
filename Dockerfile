@@ -244,6 +244,9 @@ RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.9/site-packages
 RUN git clone https://github.com/mawen1250/VapourSynth-script.git --depth=1 -b master /nnedi3_resample
 RUN mv /nnedi3_resample/nnedi3_resample.py /usr/local/lib/python3.9/site-packages
 
+RUN git clone https://github.com/Irrational-Encoding-Wizardry/vsutil.git --depth=1 -b master /vsutil
+RUN mv /vsutil/vsutil /usr/local/lib/python3.9/site-packages
+
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/havsfunc.git --depth=1 -b master /havsfunc
 RUN mv /havsfunc/havsfunc.py /usr/local/lib/python3.9/site-packages
 
