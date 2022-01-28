@@ -399,6 +399,7 @@ COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/vapoursynth/
 COPY --from=lsmash /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/*.py /usr/local/lib/python3.9/site-packages/
+COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/vsutil/ /usr/local/lib/python3.9/site-packages/
 COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=nnedi3 /nnedi3/src/nnedi3_weights.bin /usr/local/share/nnedi3/
 COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
