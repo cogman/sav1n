@@ -637,7 +637,9 @@ fn aom_firstpass_for_scene_detection(
 }
 
 fn start_aom_scene_detection() -> Child {
-    Command::new("aomenc")
+    Command::new("nice")
+        .arg("-20")
+        .arg("aomenc")
         .arg("--passes=2")
         .arg("--pass=1")
         .arg("--bit-depth=10")
@@ -653,7 +655,9 @@ fn start_aom_scene_detection() -> Child {
 }
 
 fn start_vspipe(input: &str, vpy: &str) -> Child {
-    Command::new("vspipe")
+    Command::new("nice")
+        .arg("-20")
+        .arg("vspipe")
         .arg("-c")
         .arg("y4m")
         .arg("-t")
