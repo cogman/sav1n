@@ -336,7 +336,7 @@ COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
 WORKDIR /ffmpeg
-RUN git clone --branch 'release/4.4' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
+RUN git clone --branch 'release/5.0' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
     ./configure \
       --disable-doc \
