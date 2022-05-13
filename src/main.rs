@@ -18,6 +18,7 @@ use std::ops::{BitAnd, Not};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use glob::glob;
 use tokio::fs::remove_file;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
@@ -37,17 +38,20 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 async fn main() {
     let options = extract_options();
 
-    if let Some(input) = options.value_of("input") {
-        let i = String::from(input);
+    for entry in glob(options.value_of_t_or_exit::<String>("input").as_str()).unwrap() {
+        let entry_unwrapped = entry.unwrap();
+        let input_path = entry_unwrapped.as_path();
+        let i: String = input_path.clone().to_str().unwrap().to_string();
+
         let encoders = options.value_of_t_or_exit("encoders");
         let cpu_used = options.value_of_t_or_exit("cpu_used");
         let vpy: String = options.value_of_t_or_exit("vpy");
         let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
 
         let active_encodes = Arc::new(Semaphore::new(encoders));
-        let audio_processing = encode_audio(i, active_encodes.clone());
+        let audio_processing = encode_audio(i.clone(), active_encodes.clone());
 
-        let mut vspipe = start_vspipe(input, vpy.as_str());
+        let mut vspipe = start_vspipe(i.clone().as_str(), vpy.as_str());
 
         let vspipe_output = vspipe.stdout.take().unwrap();
 
@@ -112,7 +116,6 @@ async fn main() {
             .wait()
             .await
             .unwrap();
-        let input_path = Path::new(&input);
         let output_name = String::from(
             input_path
                 .with_extension("new.mkv")
@@ -176,6 +179,14 @@ async fn main() {
                 .await
                 .unwrap();
         }
+        Command::new("rm")
+            .arg("-rf")
+            .arg("/tmp/*")
+            .spawn()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
     }
 }
 
