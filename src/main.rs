@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::fs::read_dir;
 use std::ops::{BitAnd, Not};
 use std::path::Path;
 use std::process::Stdio;
@@ -179,14 +180,10 @@ async fn main() {
                 .await
                 .unwrap();
         }
-        Command::new("rm")
-            .arg("-rf")
-            .arg("/tmp/*")
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+
+        for entry in read_dir("/tmp").unwrap() {
+            remove_file(entry.unwrap().path()).await;
+        }
     }
 }
 
