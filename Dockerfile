@@ -68,6 +68,7 @@ ARG CXXFLAGS="-O3 -march=znver1 -fPIC"
 FROM build AS vapoursynth
 RUN mkdir -p /vapoursynth/dependencies && git clone https://github.com/sekrit-twc/zimg -b master --depth=1 /vapoursynth/dependencies/zimg
 WORKDIR /vapoursynth/dependencies/zimg
+RUN git submodule update --init --recursive
 RUN ./autogen.sh  && \
     ./configure --enable-x86simd --disable-static --enable-shared --with-plugindir=/usr/local/lib/vapoursynth && \
     make && \
