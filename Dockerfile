@@ -74,7 +74,7 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R57 /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R59 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -82,19 +82,19 @@ RUN ./autogen.sh && \
     make install
 
 FROM vapoursynth AS miscFilters
-RUN git clone https://github.com/vapoursynth/vs-miscfilters-obsolete.git -b master /vs-misc
+RUN git clone https://github.com/vapoursynth/vs-miscfilters-obsolete.git --depth=1 -b master /vs-misc
 WORKDIR /vs-misc
 RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS removegrain
-RUN git clone https://github.com/vapoursynth/vs-removegrain.git -b master /removegrain
+RUN git clone https://github.com/vapoursynth/vs-removegrain.git --depth=1 -b master /removegrain
 WORKDIR /removegrain
 RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS vivtc
-RUN git clone https://github.com/vapoursynth/vivtc.git -b master /vivtc
+RUN git clone https://github.com/vapoursynth/vivtc.git --depth=1 -b master /vivtc
 WORKDIR /vivtc
 RUN meson build && \
     ninja -C build
@@ -228,7 +228,7 @@ RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS znedi3
-RUN git clone https://github.com/sekrit-twc/znedi3.git /znedi3
+RUN git clone https://github.com/sekrit-twc/znedi3.git --depth=1 /znedi3
 WORKDIR /znedi3
 RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
     git submodule init && \
