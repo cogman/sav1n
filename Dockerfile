@@ -228,7 +228,7 @@ RUN meson build && \
     ninja -C build
 
 FROM vapoursynth AS znedi3
-RUN git clone https://github.com/sekrit-twc/znedi3.git --depth=1 /znedi3
+RUN git clone https://github.com/sekrit-twc/znedi3.git -n /znedi3
 WORKDIR /znedi3
 RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
     git submodule init && \
