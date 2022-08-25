@@ -41,9 +41,11 @@ async fn main() {
 
     let targets: Vec<PathBuf> = options.get_many::<String>("input")
         .expect("At least one input is required")
-        .flat_map(move |f| glob(f).unwrap())
+        .flat_map(move |f| glob(f.as_str()).unwrap())
         .map(move |f| f.unwrap())
         .collect();
+
+    println!("Encoding {} files", targets.len());
 
     let encoders = options.value_of_t_or_exit("encoders");
     let cpu_used = options.value_of_t_or_exit("cpu_used");
@@ -51,23 +53,30 @@ async fn main() {
     let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
     let active_encodes = Arc::new(Semaphore::new(encoders));
 
-    let can_do_next = Semaphore::new(1);
-    task::spawn(async move {
-        let mut tasks = vec![];
-        for entry in targets {
-            can_do_next.acquire().await.unwrap().forget();
-            tasks.len();
-            tasks.push(compress_file(cpu_used, &vpy, vmaf_target, &active_encodes, entry.clone(), &can_do_next, tasks.len()));
-        }
+    let mut tasks = vec![];
+    let can_do_next = Arc::new(Semaphore::new(0));
+    for entry in targets {
+        let len = tasks.len();
 
-        for task in tasks {
-            task.await;
-        }
-    }).await.unwrap();
+        let vpy = vpy.clone();
+        let active_encodes = active_encodes.clone();
+        let entry = entry.clone();
+        let cdn = can_do_next.clone();
+
+        tasks.push(tokio::spawn(async move {
+            compress_file(cpu_used, vpy, vmaf_target, active_encodes, entry, cdn, len).await
+        }));
+        can_do_next.acquire().await.unwrap().forget()
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
 }
 
-async fn compress_file(cpu_used: u32, vpy: &String, vmaf_target: f64, active_encoders: &Arc<Semaphore>, input_path: PathBuf, can_do_next: &Semaphore, processed_file: usize) {
+async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_encoders: Arc<Semaphore>, input_path: PathBuf, can_do_next: Arc<Semaphore>, processed_file: usize) {
     let i: String = input_path.to_str().unwrap().to_string();
+    println!("Encoding {}", i);
     let tmp_folder = format!("/tmp/{}", processed_file);
     create_dir(&tmp_folder).await.unwrap();
 
