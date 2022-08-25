@@ -14,13 +14,12 @@ use serde_json::Value;
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::fmt::format;
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use glob::{glob};
-use tokio::fs::{create_dir, remove_dir, remove_file};
+use tokio::fs::{create_dir, remove_dir_all, remove_file};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
 use tokio::join;
@@ -210,7 +209,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
             .unwrap();
     }
 
-    remove_dir(&tmp_folder).await.unwrap();
+    remove_dir_all(tmp_folder).await.unwrap();
 }
 
 fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinHandle<()> {
