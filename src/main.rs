@@ -706,6 +706,7 @@ fn start_vspipe(input: &str, vpy: &str, tmp_folder: String) -> Child {
         .arg(format!("{}/timecodes.txt", tmp_folder))
         .arg("--arg")
         .arg(format!("file={}", input))
+        .arg("--arg")
         .arg(format!("tmp_folder={}", tmp_folder))
         .arg(vpy)
         .arg("-")
