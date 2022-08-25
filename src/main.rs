@@ -209,6 +209,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
             .unwrap();
     }
 
+    println!("Cleaning up temp folder");
     remove_dir_all(tmp_folder).await.unwrap();
 }
 
@@ -297,12 +298,13 @@ fn vpx_process(
             .unwrap();
         let prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         vpx_header.clone().write(&mut file).await.unwrap();
+        let mut inflight_scenes = vec![];
         while let Ok(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
                 file.flush().await.unwrap();
                 file.shutdown().await.unwrap();
                 drop(file);
-                compress_scene(
+                inflight_scenes.push(compress_scene(
                     scene,
                     active_encodes_vpx.clone(),
                     prior_cq_values.clone(),
@@ -310,7 +312,7 @@ fn vpx_process(
                     cpu_used,
                     tmp_folder.clone(),
                 )
-                .await;
+                .await);
                 scene += 1;
                 file = File::create(format!("{}/{:06}.y4m", tmp_folder, scene))
                     .await
@@ -326,7 +328,8 @@ fn vpx_process(
                 break;
             }
         }
-        compress_scene(
+        println!("Compressing final scene");
+        inflight_scenes.push(compress_scene(
             scene,
             active_encodes_vpx.clone(),
             prior_cq_values.clone(),
@@ -334,7 +337,10 @@ fn vpx_process(
             cpu_used,
             tmp_folder.clone(),
         )
-        .await;
+        .await);
+        for scene in inflight_scenes {
+            scene.await.unwrap();
+        }
         scene
     })
 }
@@ -373,11 +379,10 @@ async fn compress_scene(
             guard.insert(insertion_index, cq);
             drop(guard);
         }
-        second_pass(scene_number, cq, cpu_used, tmp_folder.clone())
-            .await
-            .wait()
-            .await
-            .unwrap();
+        let mut second = second_pass(scene_number, cq, cpu_used, tmp_folder.clone())
+            .await;
+        second.wait().await.unwrap();
+        drop(second);
         encoding_scenes.add_permits(1);
         cleanup(scene_number, tmp_folder).await;
     })
@@ -563,6 +568,9 @@ async fn vmaf_secant_search(
             }
         } else if next == x1 {
             // We are so close that the next guess ends up being the current guess, just jump out
+            break;
+        }
+        if x1 == max && fx1 > 0.0 {
             break;
         }
         x1 = next;
