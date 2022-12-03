@@ -7,7 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-jemallocator = "^0.3"
+jemallocator = "^0.5"
 tokio = { version="^1", features=["io-std", "fs", "io-util", "time", "process", "macros", "rt-multi-thread", "sync"] }
 clap = "^3.0.0-beta.4"
 regex = "^1"

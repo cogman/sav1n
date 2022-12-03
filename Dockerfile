@@ -74,7 +74,7 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R59 /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R60 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -235,6 +235,13 @@ RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
     git submodule update --recursive 
 RUN make x86=1
 
+FROM vapoursynth AS tonemap
+RUN git clone https://github.com/ifb/vapoursynth-tonemap.git --depth=1 -b master /tonemap
+WORKDIR /tonemap
+RUN ./autogen.sh && \
+    ./configure && \
+    make
+
 FROM vapoursynth AS HAvsFunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
 RUN mv /adjust/adjust.py /usr/local/lib/python3.9/site-packages
@@ -272,6 +279,7 @@ COPY --from=temporalsoften2 /temporalsoften2/build/*.so /usr/local/lib/vapoursyn
 COPY --from=ttempsmooth /ttempsmooth/build/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/lib/vapoursynth
+COPY --from=tonemap /tonemap/.libs/*.so /usr/local/lib/vapoursynth
 
 FROM build AS aom
 RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b master /aom
@@ -337,7 +345,7 @@ COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
 WORKDIR /ffmpeg
-RUN git clone --branch 'release/5.0' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
+RUN git clone --branch 'release/5.1' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
     ./configure \
       --disable-doc \
