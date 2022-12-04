@@ -502,7 +502,7 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder:
         static ref VMAF_RE: Regex = Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap();
     }
     let results = String::from_utf8(ffmpeg_output.unwrap().stderr).unwrap();
-    let captures = VMAF_RE.captures(results.as_str()).unwrap();
+    let captures = VMAF_RE.captures(results.as_str()).expect(format!("Failed to decode: {}", results).as_str());
     let capture = &captures[1];
 
     capture.parse().map(|n: f64| n / 100.0).unwrap()
