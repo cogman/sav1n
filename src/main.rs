@@ -489,7 +489,7 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder:
         .arg("-threads")
         .arg("1")
         .arg("-lavfi")
-        .arg("libvmaf=model_path=/usr/local/share/model/vmaf_v0.6.1.json")
+        .arg("libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'")
         .arg("-f")
         .arg("null")
         .arg("-")
