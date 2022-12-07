@@ -2,6 +2,8 @@ mod aom_firstpass;
 mod frame;
 mod frame_buffer;
 mod video_header;
+mod encoder;
+mod vp9_encoder;
 
 use crate::aom_firstpass::aom::AomFirstpass;
 use crate::frame::Status::Processing;
@@ -9,7 +11,7 @@ use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
 use clap::{App, Arg, ArgMatches};
 use lazy_static::lazy_static;
-use regex::Regex;
+use regex::{Captures, Regex};
 use serde_json::Value;
 
 use std::collections::VecDeque;
@@ -28,6 +30,8 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::{JoinHandle};
+use crate::encoder::{Encoder, EncoderOptions};
+use crate::vp9_encoder::Vp9Encoder;
 
 extern crate jemallocator;
 
@@ -50,6 +54,11 @@ async fn main() {
     let cpu_used = options.value_of_t_or_exit("cpu_used");
     let vpy: String = options.value_of_t_or_exit("vpy");
     let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
+    let encoder_str: String = options.value_of_t_or_exit::<String>("codec");
+    let encoder: Arc<dyn Encoder + Send + Sync> = match encoder_str.as_str() {
+        "vpx" => Arc::new(Vp9Encoder{}),
+        _ => panic!("Shouldn't have gotten here")
+    };
     let active_encodes = Arc::new(Semaphore::new(encoders));
 
     let mut tasks = vec![];
@@ -61,9 +70,10 @@ async fn main() {
         let active_encodes = active_encodes.clone();
         let entry = entry.clone();
         let cdn = can_do_next.clone();
+        let e = encoder.clone();
 
         tasks.push(tokio::spawn(async move {
-            compress_file(cpu_used, vpy, vmaf_target, active_encodes, entry, cdn, len).await
+            compress_file(cpu_used, vpy, vmaf_target, active_encodes, entry, cdn, len, e).await
         }));
         can_do_next.acquire().await.unwrap().forget()
     }
@@ -73,7 +83,7 @@ async fn main() {
     }
 }
 
-async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_encoders: Arc<Semaphore>, input_path: PathBuf, can_do_next: Arc<Semaphore>, processed_file: usize) {
+async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_encoders: Arc<Semaphore>, input_path: PathBuf, can_do_next: Arc<Semaphore>, processed_file: usize, encoder: Arc<dyn Encoder + Send + Sync>) {
     let i: String = input_path.to_str().unwrap().to_string();
     println!("Encoding {}", i);
     let tmp_folder = format!("/tmp/{}", processed_file);
@@ -95,7 +105,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
 
     let frame_stats_processor = stats_processor(header.clone(), delayed_aom, stats_tx, tmp_folder.clone());
 
-    let vpx_processing = vpx_process(
+    let processing = process(
         stats_rx,
         buffer.clone(),
         header.clone(),
@@ -103,6 +113,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
         vmaf_target,
         cpu_used,
         tmp_folder.clone(),
+        encoder
     );
 
     let aom_first_pass_scene =
@@ -115,7 +126,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
     drop(vs_pipe_reader);
     drop(vspipe);
     can_do_next.add_permits(1);
-    let scenes = vpx_processing.await.unwrap();
+    let scenes = processing.await.unwrap();
     aom_first_pass_scene.await.unwrap();
     frame_stats_processor.await.unwrap();
     audio_processing.await.unwrap();
@@ -282,14 +293,15 @@ fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinH
     })
 }
 
-fn vpx_process(
+fn process(
     mut stats_rx: Receiver<FrameStats>,
     scene_buffer: Arc<FrameBuffer>,
-    vpx_header: VideoHeader,
+    header: VideoHeader,
     active_encodes_vpx: Arc<Semaphore>,
     vmaf_target: f64,
     cpu_used: u32,
     tmp_folder: String,
+    encoder: Arc<dyn Encoder + Send + Sync>
 ) -> JoinHandle<u32> {
     task::spawn(async move {
         let mut scene: u32 = 0;
@@ -297,7 +309,7 @@ fn vpx_process(
             .await
             .unwrap();
         let prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-        vpx_header.clone().write(&mut file).await.unwrap();
+        header.clone().write(&mut file).await.unwrap();
         let mut inflight_scenes = vec![];
         while let Ok(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
@@ -311,13 +323,14 @@ fn vpx_process(
                     vmaf_target,
                     cpu_used,
                     tmp_folder.clone(),
+                    encoder.clone()
                 )
                 .await);
                 scene += 1;
                 file = File::create(format!("{}/{:06}.y4m", tmp_folder, scene))
                     .await
                     .unwrap();
-                vpx_header.clone().write(&mut file).await.unwrap();
+                header.clone().write(&mut file).await.unwrap();
             }
             let frame = scene_buffer.get_frame(stat.frame_num).await;
             if let Some(frame_data) = frame {
@@ -336,6 +349,7 @@ fn vpx_process(
             vmaf_target,
             cpu_used,
             tmp_folder.clone(),
+            encoder
         )
         .await);
         for scene in inflight_scenes {
@@ -352,10 +366,11 @@ async fn compress_scene(
     vmaf_target: f64,
     cpu_used: u32,
     tmp_folder: String,
+    encoder: Arc<dyn Encoder + Send + Sync>
 ) -> JoinHandle<()> {
     encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
-        let mut first_pass = first_pass(scene_number, tmp_folder.clone()).await;
+        let mut first_pass = first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await;
         first_pass.wait().await.unwrap();
         let mut initial_min = 20;
         let mut initial_max = 40;
@@ -371,7 +386,7 @@ async fn compress_scene(
             drop(guard);
         }
         let cq =
-            vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number, tmp_folder.clone()).await;
+            vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number, tmp_folder.clone(), encoder.clone()).await;
         encoding_scenes.add_permits(1);
         {
             let mut guard = prior_cq_values.lock().await;
@@ -379,7 +394,7 @@ async fn compress_scene(
             guard.insert(insertion_index, cq);
             drop(guard);
         }
-        let mut second = second_pass(scene_number, cq, cpu_used, tmp_folder.clone())
+        let mut second = second_pass(scene_number, cq, cpu_used, tmp_folder.clone(), encoder.clone())
             .await;
         second.wait().await.unwrap();
         drop(second);
@@ -388,52 +403,29 @@ async fn compress_scene(
     })
 }
 
-async fn first_pass(scene_number: u32, tmp_folder: String) -> Child {
+async fn first_pass(scene_number: u32, tmp_folder: String, encoder: Arc<dyn Encoder + Send + Sync>) -> Child {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    Command::new("vpxenc")
-        .arg("--quiet")
-        .arg("--passes=2")
-        .arg("--pass=1")
-        .arg("-b")
-        .arg("10")
-        .arg("--profile=2")
-        .arg("--threads=1")
-        .arg(format!("--fpf={}.log", scene_str))
-        .arg("--end-usage=q")
-        .arg("-o")
-        .arg("/dev/null")
-        .arg(format!("{}.y4m", scene_str))
+    encoder.first_pass(EncoderOptions {
+        log_file: format!("{}.log", scene_str).as_str(),
+        input: format!("{}.y4m", scene_str).as_str(),
+        output: "/dev/null",
+        ..Default::default()
+    })
         .spawn()
         .unwrap()
 }
 
-async fn second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder: String) -> Child {
+async fn second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder: String, encoder: Arc<dyn Encoder + Send + Sync>) -> Child {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    Command::new("vpxenc")
-        .arg(format!("--cq-level={}", cq))
-        .arg(format!("--cpu-used={}", cpu_used))
-        .arg(format!("--fpf={}.log", scene_str))
-        .arg("--quiet")
-        .arg("--passes=2")
-        .arg("--pass=2")
-        .arg("--profile=2")
-        .arg("--good")
-        .arg("--lag-in-frames=25")
-        .arg("--kf-max-dist=250")
-        .arg("--auto-alt-ref=1")
-        .arg("--arnr-strength=1")
-        .arg("--arnr-maxframes=7")
-        .arg("--enable-tpl=1")
-        .arg("--threads=1")
-        .arg("-b")
-        .arg("10")
-        .arg("--end-usage=q")
-        .arg("--ivf")
-        .arg("-o")
-        .arg(format!("{}.ivf", scene_str))
-        .arg(format!("{}.y4m", scene_str))
-        .spawn()
-        .unwrap()
+    encoder.second_pass(EncoderOptions {
+        cq: cq,
+        cpu_used: cpu_used,
+        log_file: format!("{}.log", scene_str).as_str(),
+        input: format!("{}.y4m", scene_str).as_str(),
+        output: format!("{}.ivf", scene_str).as_str(),
+        ..Default::default()
+    }).spawn()
+    .unwrap()
 }
 
 async fn cleanup(scene_number: u32, tmp_folder: String) {
@@ -445,32 +437,23 @@ async fn cleanup(scene_number: u32, tmp_folder: String) {
     scene.unwrap();
 }
 
-async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder: String) -> f64 {
+async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder: String, encoder: Arc<dyn  Encoder + Send + Sync>) -> f64 {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
     let threads = if cpu_used > 3 { 1 } else { 2 };
-    let mut vpx = Command::new("vpxenc")
-        .arg(format!("--cq-level={}", cq))
-        .arg(format!("--cpu-used={}", cpu_used))
-        .arg(format!("--fpf={}.log", scene_str))
-        .arg(format!("--threads={}", threads))
-        .arg("--quiet")
-        .arg("--passes=2")
-        .arg("--pass=2")
-        .arg("--profile=2")
-        .arg("-b")
-        .arg("10")
-        .arg("--end-usage=q")
-        .arg("--ivf")
-        .arg("--row-mt=1")
-        .arg("--tile-columns=1")
-        .arg("-o")
-        .arg("-")
-        .arg(format!("{}.y4m", scene_str))
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut encode = encoder.second_pass(EncoderOptions {
+        cq,
+        cpu_used,
+        threads,
+        log_file: format!("{}.log", scene_str).as_str(),
+        output: "-",
+        input: format!("{}.y4m", scene_str).as_str(),
+        ..Default::default()
+    })
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
 
-    let vpx_stdin: Stdio = vpx
+    let encode_stdin: Stdio = encode
         .stdout
         .take()
         .unwrap()
@@ -478,7 +461,7 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder:
         .expect("failed to convert to Stdio");
 
     let ffmpeg = Command::new("ffmpeg")
-        .stdin(vpx_stdin)
+        .stdin(encode_stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .arg("-y")
@@ -496,14 +479,14 @@ async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder:
         .spawn()
         .unwrap();
 
-    let (_, ffmpeg_output) = join!(vpx.wait(), ffmpeg.wait_with_output());
+    let (_, ffmpeg_output) = join!(encode.wait(), ffmpeg.wait_with_output());
 
     lazy_static! {
         static ref VMAF_RE: Regex = Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap();
     }
     let results = String::from_utf8(ffmpeg_output.unwrap().stderr).unwrap();
-    let captures = VMAF_RE.captures(results.as_str()).expect(format!("Failed to decode: {}", results).as_str());
-    let capture = &captures[1];
+    let captures: Captures = VMAF_RE.captures(results.as_str()).expect(format!("Failed to decode: {}", results).as_str());
+    let capture: &str = &captures[1];
 
     capture.parse().map(|n: f64| n / 100.0).unwrap()
 }
@@ -516,13 +499,16 @@ async fn vmaf_secant_search(
     target: f64,
     scene_number: u32,
     tmp_folder: String,
+    encoder: Arc<dyn Encoder + Send + Sync>
 ) -> u32 {
     let mut x1 = initial_guess_min;
     let mut x2 = initial_guess_max;
     let f = tmp_folder.clone();
     let f2 = tmp_folder.clone();
-    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1, 6, f.clone()).await });
-    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2, 6, f2.clone()).await });
+    let e1 = encoder.clone();
+    let e2 = encoder.clone();
+    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1, 6, f.clone(), e1).await });
+    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2, 6, f2.clone(), e2).await });
     let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
     let fx1_target = fx1_result.unwrap() - target;
     let mut fx1 = fx1_target;
@@ -574,7 +560,7 @@ async fn vmaf_secant_search(
             break;
         }
         x1 = next;
-        fx1 = vmaf_second_pass(scene_number, x1, 3, tmp_folder.clone()).await - target;
+        fx1 = vmaf_second_pass(scene_number, x1, 3, tmp_folder.clone(), encoder.clone()).await - target;
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
@@ -769,6 +755,15 @@ fn extract_options() -> ArgMatches {
                 .default_value("0")
                 .multiple_values(false)
                 .takes_value(true),
+        )
+        .arg(
+            Arg::new("codec")
+                .short('o')
+                .long("codec")
+                .default_value("vpx")
+                .possible_values(["vpx"])
+                .multiple_values(false)
+                .takes_value(true)
         )
         .get_matches()
 }
