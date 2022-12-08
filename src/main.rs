@@ -4,6 +4,7 @@ mod frame_buffer;
 mod video_header;
 mod encoder;
 mod vp9_encoder;
+mod av1_encoder;
 
 use crate::aom_firstpass::aom::AomFirstpass;
 use crate::frame::Status::Processing;
@@ -30,6 +31,7 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::{JoinHandle};
+use crate::av1_encoder::Av1Encoder;
 use crate::encoder::{Encoder, EncoderOptions};
 use crate::vp9_encoder::Vp9Encoder;
 
@@ -57,6 +59,7 @@ async fn main() {
     let encoder_str: String = options.value_of_t_or_exit::<String>("codec");
     let encoder: Arc<dyn Encoder + Send + Sync> = match encoder_str.as_str() {
         "vpx" => Arc::new(Vp9Encoder{}),
+        "av1" => Arc::new(Av1Encoder{}),
         _ => panic!("Shouldn't have gotten here")
     };
     let active_encodes = Arc::new(Semaphore::new(encoders));
@@ -761,7 +764,7 @@ fn extract_options() -> ArgMatches {
                 .short('o')
                 .long("codec")
                 .default_value("vpx")
-                .possible_values(["vpx"])
+                .possible_values(["vpx", "av1"])
                 .multiple_values(false)
                 .takes_value(true)
         )
