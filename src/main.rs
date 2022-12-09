@@ -54,6 +54,7 @@ async fn main() {
 
     let encoders = options.value_of_t_or_exit("encoders");
     let cpu_used = options.value_of_t_or_exit("cpu_used");
+    let vmaf_cpu_used = options.value_of_t_or_exit("vmaf_cpu_used");
     let vpy: String = options.value_of_t_or_exit("vpy");
     let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
     let encoder_str: String = options.value_of_t_or_exit::<String>("codec");
@@ -76,7 +77,7 @@ async fn main() {
         let e = encoder.clone();
 
         tasks.push(tokio::spawn(async move {
-            compress_file(cpu_used, vpy, vmaf_target, active_encodes, entry, cdn, len, e).await
+            compress_file(cpu_used, vmaf_cpu_used, vpy, vmaf_target, active_encodes, entry, cdn, len, e).await
         }));
         can_do_next.acquire().await.unwrap().forget()
     }
@@ -86,7 +87,7 @@ async fn main() {
     }
 }
 
-async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_encoders: Arc<Semaphore>, input_path: PathBuf, can_do_next: Arc<Semaphore>, processed_file: usize, encoder: Arc<dyn Encoder + Send + Sync>) {
+async fn compress_file(cpu_used: u32, vmaf_cpu_used: u32, vpy: String, vmaf_target: f64, active_encoders: Arc<Semaphore>, input_path: PathBuf, can_do_next: Arc<Semaphore>, processed_file: usize, encoder: Arc<dyn Encoder + Send + Sync>) {
     let i: String = input_path.to_str().unwrap().to_string();
     println!("Encoding {}", i);
     let tmp_folder = format!("/tmp/{}", processed_file);
@@ -115,6 +116,7 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
         active_encoders.clone(),
         vmaf_target,
         cpu_used,
+        vmaf_cpu_used,
         tmp_folder.clone(),
         encoder
     );
@@ -253,6 +255,7 @@ fn process(
     active_encodes_vpx: Arc<Semaphore>,
     vmaf_target: f64,
     cpu_used: u32,
+    vmaf_cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>
 ) -> JoinHandle<u32> {
@@ -275,6 +278,7 @@ fn process(
                     prior_cq_values.clone(),
                     vmaf_target,
                     cpu_used,
+                    vmaf_cpu_used,
                     tmp_folder.clone(),
                     encoder.clone()
                 )
@@ -301,6 +305,7 @@ fn process(
             prior_cq_values.clone(),
             vmaf_target,
             cpu_used,
+            vmaf_cpu_used,
             tmp_folder.clone(),
             encoder
         )
@@ -318,6 +323,7 @@ async fn compress_scene(
     prior_cq_values: Arc<Mutex<Vec<u32>>>,
     vmaf_target: f64,
     cpu_used: u32,
+    vmaf_cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>
 ) -> JoinHandle<()> {
@@ -339,7 +345,7 @@ async fn compress_scene(
             drop(guard);
         }
         let cq =
-            vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_target, scene_number, tmp_folder.clone(), encoder.clone()).await;
+            vmaf_secant_search(10, 60, initial_min, initial_max, vmaf_cpu_used, vmaf_target, scene_number, tmp_folder.clone(), encoder.clone()).await;
         encoding_scenes.add_permits(1);
         {
             let mut guard = prior_cq_values.lock().await;
@@ -449,6 +455,7 @@ async fn vmaf_secant_search(
     max: u32,
     initial_guess_min: u32,
     initial_guess_max: u32,
+    vmaf_cpu_used: u32,
     target: f64,
     scene_number: u32,
     tmp_folder: String,
@@ -513,7 +520,7 @@ async fn vmaf_secant_search(
             break;
         }
         x1 = next;
-        fx1 = vmaf_second_pass(scene_number, x1, 3, tmp_folder.clone(), encoder.clone()).await - target;
+        fx1 = vmaf_second_pass(scene_number, x1, vmaf_cpu_used, tmp_folder.clone(), encoder.clone()).await - target;
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
@@ -706,6 +713,13 @@ fn extract_options() -> ArgMatches {
                 .short('c')
                 .long("cpu_used")
                 .default_value("0")
+                .multiple_values(false)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("vmaf_cpu_used")
+                .long("vmaf_cpu_used")
+                .default_value("3")
                 .multiple_values(false)
                 .takes_value(true),
         )
