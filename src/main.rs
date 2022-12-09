@@ -396,9 +396,8 @@ async fn cleanup(scene_number: u32, tmp_folder: String) {
     scene.unwrap();
 }
 
-async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, tmp_folder: String, encoder: Arc<dyn  Encoder + Send + Sync>) -> f64 {
+async fn vmaf_second_pass(scene_number: u32, cq: u32, cpu_used: u32, threads: u32, tmp_folder: String, encoder: Arc<dyn  Encoder + Send + Sync>) -> f64 {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    let threads = if cpu_used > 3 { 1 } else { 2 };
     let mut encode = encoder.second_pass(EncoderOptions {
         cq,
         cpu_used,
@@ -467,8 +466,8 @@ async fn vmaf_secant_search(
     let f2 = tmp_folder.clone();
     let e1 = encoder.clone();
     let e2 = encoder.clone();
-    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1, 6, f.clone(), e1).await });
-    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2, 6, f2.clone(), e2).await });
+    let first_fx1 = task::spawn(async move { vmaf_second_pass(scene_number, x1, 6, 1, f.clone(), e1).await });
+    let first_fx2 = task::spawn(async move { vmaf_second_pass(scene_number, x2, 6, 1, f2.clone(), e2).await });
     let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
     let fx1_target = fx1_result.unwrap() - target;
     let mut fx1 = fx1_target;
@@ -520,7 +519,7 @@ async fn vmaf_secant_search(
             break;
         }
         x1 = next;
-        fx1 = vmaf_second_pass(scene_number, x1, vmaf_cpu_used, tmp_folder.clone(), encoder.clone()).await - target;
+        fx1 = vmaf_second_pass(scene_number, x1, vmaf_cpu_used, 2, tmp_folder.clone(), encoder.clone()).await - target;
         iterations += 1;
     }
     println!("{}: {}:{}", scene_number, x1, fx1 + target);
