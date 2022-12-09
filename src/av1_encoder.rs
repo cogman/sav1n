@@ -1,4 +1,3 @@
-use std::ops::{Deref, DerefMut};
 use tokio::process::Command;
 use crate::encoder::{Encoder, EncoderOptions};
 

@@ -134,31 +134,12 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
     frame_stats_processor.await.unwrap();
     audio_processing.await.unwrap();
 
-    let mut concat_file = File::create(format!("{}/concat.txt", tmp_folder)).await.unwrap();
-    for scene in 0..=scenes {
-        let concat_line = format!("file '{}/{:06}.ivf'\n", tmp_folder, scene);
-        concat_file.write_all(concat_line.as_bytes()).await.unwrap();
-    }
-    concat_file.flush().await.unwrap();
-    concat_file.shutdown().await.unwrap();
-    drop(concat_file);
+    concat(input_path, tmp_folder.clone(), scenes).await;
+    println!("Cleaning up temp folder");
+    remove_dir_all(tmp_folder).await.unwrap();
+}
 
-    Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-f")
-        .arg("concat")
-        .arg("-safe")
-        .arg("0")
-        .arg("-i")
-        .arg(format!("{}/concat.txt", tmp_folder))
-        .arg("-c")
-        .arg("copy")
-        .arg(format!("{}/video.mkv", tmp_folder))
-        .spawn()
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
+async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
     let output_name = String::from(
         input_path
             .with_extension("new.mkv")
@@ -167,64 +148,33 @@ async fn compress_file(cpu_used: u32, vpy: String, vmaf_target: f64, active_enco
             .to_str()
             .unwrap(),
     );
-    if Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists() {
-        Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-i")
-            .arg(format!("{}/video.mkv", tmp_folder))
-            .arg("-i")
-            .arg(format!("{}/audio.mkv", tmp_folder))
-            .arg("-map")
-            .arg("0:v")
-            .arg("-map")
-            .arg("1:a")
-            .arg("-map")
-            .arg("1:s?")
-            .arg("-c")
-            .arg("copy")
-            .arg(format!("{}/audiovideo.mkv", tmp_folder))
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
 
-        Command::new("mkvmerge")
-            .arg("--output")
-            .arg(output_name)
-            .arg("--timestamps")
-            .arg(format!("0:{}/timecodes.txt", tmp_folder))
-            .arg(format!("{}/audiovideo.mkv", tmp_folder))
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
-    } else {
-        Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-i")
-            .arg(format!("{}/video.mkv", tmp_folder))
-            .arg("-i")
-            .arg(format!("{}/audio.mkv", tmp_folder))
-            .arg("-map")
-            .arg("0:v")
-            .arg("-map")
-            .arg("1:a")
-            .arg("-map")
-            .arg("1:s?")
-            .arg("-c")
-            .arg("copy")
-            .arg(output_name)
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+    let mut options: Vec<String> = Vec::new();
+    options.push("-o".to_string());
+    options.push(output_name.clone());
+    options.push("[".to_string());
+    for scene in 0..=scenes {
+        let concat_line = format!("{}/{:06}.ivf", tmp_folder, scene);
+        options.push(concat_line);
     }
+    options.push("]".to_string());
 
-    println!("Cleaning up temp folder");
-    remove_dir_all(tmp_folder).await.unwrap();
+    if Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists() {
+        options.push("--timestamps".to_string());
+        options.push(format!("0:{}/timecodes.txt", tmp_folder));
+    }
+    options.push(format!("{}/audio.mkv", tmp_folder));
+    serde_json::to_writer(&std::fs::File::create(format!("{}/options.json", tmp_folder).as_str()).expect("could not create options file"), &options)
+        .expect("Failed to serialize options file");
+
+    println!("Writing {}", output_name);
+    Command::new("mkvmerge")
+        .arg(format!("@{}/options.json", tmp_folder).as_str())
+        .spawn()
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
 }
 
 fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinHandle<()> {
