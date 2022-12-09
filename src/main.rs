@@ -486,7 +486,7 @@ async fn vmaf_secant_search(
     while fx1.abs() > 0.005 && iterations < 10 {
         let mut next = (x1 as f64 - (fx1 * ((x1 as f64 - x2 as f64) / (fx1 - fx2)))).floor() as u32;
         println!(
-            "{}({}): {}:{} {}:{} -> {}",
+            "{}({}): {}:{} {}:{} → {}",
             scene_number,
             iterations,
             x1,
