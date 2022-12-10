@@ -138,7 +138,7 @@ async fn compress_file(cpu_used: u32, vmaf_cpu_used: u32, vpy: String, vmaf_targ
 
     concat(input_path, tmp_folder.clone(), scenes).await;
     println!("Cleaning up temp folder");
-    remove_dir_all(tmp_folder).await.unwrap();
+//    remove_dir_all(tmp_folder).await.unwrap();
 }
 
 async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
@@ -154,6 +154,9 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
     let mut options: Vec<String> = Vec::new();
     options.push("-o".to_string());
     options.push(output_name.clone());
+
+    options.push(format!("{}/audio.mkv", tmp_folder));
+
     options.push("[".to_string());
     for scene in 0..=scenes {
         let concat_line = format!("{}/{:06}.ivf", tmp_folder, scene);
@@ -165,7 +168,6 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
         options.push("--timestamps".to_string());
         options.push(format!("0:{}/timecodes.txt", tmp_folder));
     }
-    options.push(format!("{}/audio.mkv", tmp_folder));
     serde_json::to_writer(&std::fs::File::create(format!("{}/options.json", tmp_folder).as_str()).expect("could not create options file"), &options)
         .expect("Failed to serialize options file");
 
