@@ -155,11 +155,6 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
     options.push("-o".to_string());
     options.push(output_name.clone());
 
-    if Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists() {
-        options.push("--timestamps".to_string());
-        options.push(format!("0:{}/timecodes.txt", tmp_folder));
-    }
-
     options.push(format!("{}/audio.mkv", tmp_folder));
 
     options.push("[".to_string());
@@ -168,6 +163,11 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
         options.push(concat_line);
     }
     options.push("]".to_string());
+
+    if Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists() {
+        options.push("--timestamps".to_string());
+        options.push(format!("0:{}/timecodes.txt", tmp_folder));
+    }
 
     serde_json::to_writer(&std::fs::File::create(format!("{}/options.json", tmp_folder).as_str()).expect("could not create options file"), &options)
         .expect("Failed to serialize options file");
