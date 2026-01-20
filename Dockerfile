@@ -1,13 +1,17 @@
-FROM debian:bullseye-slim AS runtime
+# syntax=docker/dockerfile:1
+
+FROM debian:trixie-slim AS runtime
 
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu/:/usr/local/lib/vapoursynth
 
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
     alien \
     clinfo \
     libass9 \
     libfftw3-bin \
-    libpython3.9 \
+    libpython3.13 \
     libvdpau1 \
     libva2 \
     libva-drm2 \
@@ -15,11 +19,13 @@ RUN apt-get update && apt-get install -y \
     mkvtoolnix \
     ocl-icd-libopencl1 \
     python3 \
-    && rm -rf /var/lib/apt/lists/*
+    xxhash
 
-FROM rust:slim-bullseye AS rustBuild
+FROM rust:slim-trixie AS rustBuild
 WORKDIR /sav1n
-RUN apt-get update && apt-get install -y make fd-find && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y make fd-find
 COPY src/ src/
 COPY Cargo.toml .
 COPY Cargo.lock .
@@ -27,13 +33,19 @@ ENV RUSTFLAGS "-Zsanitizer=address"
 ENV RUSTDOCFLAGS "-Zsanitizer=address"
 RUN rustup install nightly
 RUN rustup toolchain install nightly --component rust-src
-RUN cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+RUN --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/registry/ \
+    cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
 
-ENV RUSTFLAGS "-C target-cpu=znver1"
-RUN cargo build --release
+ENV RUSTFLAGS "-C target-cpu=x86-64-v3"
+RUN --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/registry/ \
+    cargo build --release
 
 FROM runtime AS build
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
     autoconf \
     automake \
     build-essential \
@@ -56,25 +68,26 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     texinfo \
     wget \
+    libxxhash-dev \
     yasm \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
+    zlib1g-dev
 
-RUN pip3 --no-cache-dir install meson setuptools cython sphinx
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 --no-cache-dir install --break-system-packages meson setuptools cython sphinx
 
-ARG CFLAGS="-O3 -march=znver1 -fPIC"
-ARG CXXFLAGS="-O3 -march=znver1 -fPIC"
+ENV CFLAGS "-O3 -march=x86-64-v3 -fPIC"
+ENV CXXFLAGS "-O3 -march=x86-64-v3 -fPIC"
 
 FROM build AS vapoursynth
 RUN mkdir -p /vapoursynth/dependencies && git clone https://github.com/sekrit-twc/zimg -b master --depth=1 /vapoursynth/dependencies/zimg
 WORKDIR /vapoursynth/dependencies/zimg
 RUN git submodule update --init --recursive
 RUN ./autogen.sh  && \
-    ./configure --enable-x86simd --disable-static --enable-shared --with-plugindir=/usr/local/lib/vapoursynth && \
+    ./configure --enable-x86simd --disable-static --enable-shared --with-plugindir=/usr/local/lib/vapoursynth || cat config.log && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R60 /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R73 /vapoursynth/build
 WORKDIR /vapoursynth/build
 RUN ./autogen.sh && \
     ./configure --enable-shared && \
@@ -232,7 +245,7 @@ RUN git clone https://github.com/sekrit-twc/znedi3.git -n /znedi3
 WORKDIR /znedi3
 RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
     git submodule init && \
-    git submodule update --recursive 
+    git submodule update --recursive
 RUN make x86=1
 
 FROM vapoursynth AS tonemap
@@ -244,19 +257,19 @@ RUN ./autogen.sh && \
 
 FROM vapoursynth AS HAvsFunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
-RUN mv /adjust/adjust.py /usr/local/lib/python3.9/site-packages
+RUN mv /adjust/adjust.py /usr/local/lib/python3.13/site-packages
 
 RUN git clone https://github.com/AmusementClub/mvsfunc.git --depth=1 -b mod /mvsfunc
-RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.9/site-packages
+RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.13/site-packages
 
 RUN git clone https://github.com/mawen1250/VapourSynth-script.git --depth=1 -b master /nnedi3_resample
-RUN mv /nnedi3_resample/nnedi3_resample.py /usr/local/lib/python3.9/site-packages
+RUN mv /nnedi3_resample/nnedi3_resample.py /usr/local/lib/python3.13/site-packages
 
 RUN git clone https://github.com/Irrational-Encoding-Wizardry/vsutil.git --depth=1 -b master /vsutil
-RUN mv /vsutil/vsutil /usr/local/lib/python3.9/site-packages
+RUN mv /vsutil/vsutil /usr/local/lib/python3.13/site-packages
 
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/havsfunc.git --depth=1 -b master /havsfunc
-RUN mv /havsfunc/havsfunc.py /usr/local/lib/python3.9/site-packages
+RUN mv /havsfunc/havsfunc/havsfunc.py /usr/local/lib/python3.13/site-packages
 
 COPY --from=addGrain /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=vcas /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
@@ -308,12 +321,12 @@ RUN git -C opus pull 2> /dev/null || git clone --depth 1 https://github.com/xiph
 
 FROM build AS vmaf
 WORKDIR /vmaf
-RUN wget https://github.com/Netflix/vmaf/archive/v2.1.1.tar.gz && \
-    tar xvf v2.1.1.tar.gz && \
-    mkdir -p vmaf-2.1.1/libvmaf/build &&\
-    cd vmaf-2.1.1/libvmaf/build && \
+RUN wget https://github.com/Netflix/vmaf/archive/v3.0.0.tar.gz && \
+    tar xvf v3.0.0.tar.gz
+RUN mkdir -p vmaf-3.0.0/libvmaf/build &&\
+    cd vmaf-3.0.0/libvmaf/build && \
     meson setup -Denable_tests=false -Denable_docs=false --buildtype=release .. && \
-    ninja && \
+    ninja -v 2>&1 && \
     ninja install
 
 FROM build AS vpx
@@ -345,25 +358,25 @@ COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
 WORKDIR /ffmpeg
-RUN git clone --branch 'release/5.1' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
+RUN git clone --branch 'release/8.0' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
     ./configure \
-      --disable-doc \
-      --disable-static \
-      --enable-shared \
-      --enable-pic \
-      --extra-libs="-lpthread -lm" \
-      --ld="g++" \
-      --enable-gpl \
-      --enable-libaom \
-      --enable-libass \
-      --enable-libfreetype \
-      --enable-libopus \
-      --enable-libdav1d \
-      --enable-libvmaf \
-      --enable-libvpx \
-      --enable-vapoursynth \
-      --enable-nonfree && \
+    --disable-doc \
+    --disable-static \
+    --enable-shared \
+    --enable-pic \
+    --extra-libs="-lpthread -lm" \
+    --ld="g++" \
+    --enable-gpl \
+    --enable-libaom \
+    --enable-libass \
+    --enable-libfreetype \
+    --enable-libopus \
+    --enable-libdav1d \
+    --enable-libvmaf \
+    --enable-libvpx \
+    --enable-vapoursynth \
+    --enable-nonfree && \
     make -j`nproc` && \
     make install
 
@@ -375,7 +388,12 @@ RUN autoreconf -fiv && \
     make
 
 FROM ffmpeg AS lsmash
-RUN git clone https://github.com/l-smash/l-smash --depth 1 /lsmash
+RUN git clone https://github.com/dwbuiten/obuparse --depth 1 /obuparse
+WORKDIR /obuparse
+RUN make && \
+    make install
+
+RUN git clone https://github.com/vimeo/l-smash --depth 1 /lsmash
 WORKDIR /lsmash
 RUN ./configure --enable-shared && \
     make && \
@@ -390,15 +408,13 @@ RUN meson "../VapourSynth" && \
 FROM runtime
 WORKDIR /sav1n
 
-RUN rm -rf /var/lib/apt/lists/*
-
 COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib/
 #COPY --from=vapoursynth /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=vapoursynth /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY --from=vapoursynth /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin/
 COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin/
-COPY --from=vmaf /vmaf/vmaf-2.1.1/model/vmaf_v0.6.1.json /usr/local/share/model/
+COPY --from=vmaf /vmaf/vmaf-3.0.0/model/vmaf_v0.6.1.json /usr/local/share/model/
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
@@ -407,8 +423,8 @@ COPY --from=ffmpeg /usr/local/lib/x86_64-linux-gnu/*.so* /usr/local/lib/x86_64-l
 COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/vapoursynth/
 COPY --from=lsmash /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
-COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/*.py /usr/local/lib/python3.9/site-packages/
-COPY --from=HAvsFunc /usr/local/lib/python3.9/site-packages/vsutil/ /usr/local/lib/python3.9/site-packages/vsutil/
+COPY --from=HAvsFunc /usr/local/lib/python3.13/site-packages/*.py /usr/local/lib/python3.13/site-packages/
+COPY --from=HAvsFunc /usr/local/lib/python3.13/site-packages/vsutil/ /usr/local/lib/python3.13/site-packages/vsutil/
 COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=nnedi3 /nnedi3/src/nnedi3_weights.bin /usr/local/share/nnedi3/
 COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
@@ -418,7 +434,7 @@ COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
-ENV PYTHONPATH=/usr/local/lib/python3.9/site-packages
+ENV PYTHONPATH=/usr/local/lib/python3.13/site-packages
 RUN mkdir -p /etc/OpenCL/vendors && \
     echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 ENV NVIDIA_VISIBLE_DEVICES=all

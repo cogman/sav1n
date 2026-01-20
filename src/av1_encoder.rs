@@ -1,5 +1,5 @@
-use tokio::process::Command;
 use crate::encoder::{Encoder, EncoderOptions};
+use tokio::process::Command;
 
 pub struct Av1Encoder {}
 
