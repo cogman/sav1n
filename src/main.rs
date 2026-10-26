@@ -656,7 +656,7 @@ fn stats_processor(
     tmp_folder: String,
 ) -> JoinHandle<()> {
     task::spawn(async move {
-        delayed_aom.acquire_many(96).await.unwrap().forget();
+        delayed_aom.acquire_many(112).await.unwrap().forget();
         let mut frame_stats = VecDeque::new();
         let mut keyframe = BufReader::with_capacity(
             1024,
@@ -669,19 +669,20 @@ fn stats_processor(
             .unwrap();
         let mut last = current;
         // Fill up the frame buffer
-        while frame_stats.len() < 16 {
-            frame_stats.push_back(
-                AomFirstpass::read_aom_firstpass(&mut keyframe)
-                    .await
-                    .unwrap(),
-            );
+        while frame_stats.len() < 32 {
+            match AomFirstpass::read_aom_firstpass(&mut keyframe).await {
+                Ok(stat) => frame_stats.push_back(stat),
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("Exploded unexpectedly! {}", e),
+            }
         }
         let mut since_last_keyframe = 1;
         let num_mbs = mbs(video_header.width, video_header.height);
         loop {
             delayed_aom.acquire().await.unwrap().forget();
             if since_last_keyframe >= 1000
-                || current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs)
+                || (current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs)
+                    && !current.should_test_next_gop(&frame_stats))
             {
                 let _ = stats_tx
                     .send(FrameStats {
@@ -700,7 +701,10 @@ fn stats_processor(
             }
             since_last_keyframe += 1;
             last = current;
-            current = frame_stats.pop_front().unwrap();
+            let Some(next) = frame_stats.pop_front() else {
+                break;
+            };
+            current = next;
             let stats = AomFirstpass::read_aom_firstpass(&mut keyframe).await;
             match stats {
                 Ok(stat) => frame_stats.push_back(stat),
