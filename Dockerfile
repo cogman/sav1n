@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3 \
     xxhash
 
-FROM rust:slim-trixie AS rustBuild
+FROM rust:slim-trixie AS rustbuild
 WORKDIR /sav1n
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -122,11 +122,11 @@ RUN mkdir -p /usr/local/lib/vapoursynth /usr/local/lib/python3/dist-packages/vap
     > /usr/local/bin/vapoursynth && \
     chmod +x /usr/local/bin/vapoursynth
 
-FROM vapoursynth AS alicePorts
+FROM vapoursynth AS aliceports
 RUN git clone https://github.com/AliceTeaParty/vapoursynth-api4-wheels.git /alice && \
     git -C /alice checkout 0b16c23ddfa15a3dcb72f17007f1ffd9b44b100e
 
-FROM vapoursynth AS miscFilters
+FROM vapoursynth AS miscfilters
 RUN git clone https://github.com/vapoursynth/vs-miscfilters-obsolete.git --depth=1 -b master /vs-misc
 WORKDIR /vs-misc
 RUN meson build && \
@@ -144,7 +144,7 @@ WORKDIR /vivtc
 RUN meson build && \
     ninja -C build
 
-FROM vapoursynth AS addGrain
+FROM vapoursynth AS addgrain
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-AddGrain.git --depth=1 -b master /addgrain
 WORKDIR /addgrain
 RUN meson build && \
@@ -172,7 +172,7 @@ RUN meson build && \
     ninja -C build && \
     ninja -C build install
 
-FROM alicePorts AS dfttest
+FROM aliceports AS dfttest
 WORKDIR /alice/plugins/vapoursynth-dfttest
 RUN meson build && \
     ninja -C build && \
@@ -213,7 +213,7 @@ RUN sed -i 's/#include <cmath>/#include <cmath>\n#include <math.h>/' src/MVDepan
     meson build && \
     ninja -C build
 
-FROM alicePorts AS nnedi3cl
+FROM aliceports AS nnedi3cl
 WORKDIR /alice/plugins/vapoursynth-nnedi3cl
 RUN meson build && \
     ninja -C build && \
@@ -241,7 +241,7 @@ RUN git checkout 34b2aa9f5d10c31775469b7a358f1ff52375ed1e && \
     git submodule update --recursive
 RUN make x86=1
 
-FROM vapoursynth AS HAvsFunc
+FROM vapoursynth AS havsfunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
 RUN mv /adjust/adjust.py /usr/local/lib/python3.13/dist-packages
 
@@ -268,7 +268,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     vapoursynth-akarin \
     vapoursynth-vszip
 
-COPY --from=addGrain /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
+COPY --from=addgrain /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=vcas /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=dct /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=deblock /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
@@ -332,7 +332,7 @@ WORKDIR /x265/build/linux
 RUN cmake -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DENABLE_SHARED=OFF \
+    -DENABLE_SHARED=ON \
     -DENABLE_CLI=ON \
     -DHIGH_BIT_DEPTH=ON \
     /x265/source && \
@@ -360,6 +360,9 @@ COPY --from=vmaf /usr/local/lib /usr/local/lib
 COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
+COPY --from=x265 /usr/local/include /usr/local/include
+COPY --from=x265 /usr/local/lib /usr/local/lib
+
 WORKDIR /ffmpeg
 RUN git clone --branch 'release/8.1' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
@@ -378,6 +381,7 @@ RUN git clone --branch 'release/8.1' https://github.com/FFmpeg/FFmpeg.git --dept
     --enable-libdav1d \
     --enable-libvmaf \
     --enable-libvpx \
+    --enable-libx265 \
     --enable-vapoursynth \
     --enable-nonfree && \
     make -j`nproc` && \
@@ -417,6 +421,7 @@ COPY --from=vapoursynth /usr/local/lib/python3.13/dist-packages /usr/local/lib/p
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin/
 COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin/
 COPY --from=x265 /usr/local/bin/x265 /usr/local/bin/
+COPY --from=x265 /usr/local/lib/libx265.so* /usr/local/lib/
 COPY --from=vmaf /vmaf/vmaf-3.2.1/model/vmaf_v0.6.1.json /usr/local/share/model/
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/
@@ -426,21 +431,23 @@ COPY --from=ffmpeg /usr/local/lib/x86_64-linux-gnu/*.so* /usr/local/lib/x86_64-l
 COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/vapoursynth/
 COPY --from=lsmash /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
-COPY --from=HAvsFunc /usr/local/lib/python3.13/dist-packages/*.py /usr/local/lib/python3.13/dist-packages/
-COPY --from=HAvsFunc /usr/local/lib/python3.13/dist-packages/vsutil/ /usr/local/lib/python3.13/dist-packages/vsutil/
-COPY --from=HAvsFunc /vspython/ /usr/local/lib/python3.13/dist-packages/
-COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
+COPY --from=havsfunc /usr/local/lib/python3.13/dist-packages/*.py /usr/local/lib/python3.13/dist-packages/
+COPY --from=havsfunc /usr/local/lib/python3.13/dist-packages/vsutil/ /usr/local/lib/python3.13/dist-packages/vsutil/
+COPY --from=havsfunc /vspython/ /usr/local/lib/python3.13/dist-packages/
+COPY --from=havsfunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/share/nnedi3/
 COPY --from=nnedi3cl /usr/local/share/NNEDI3CL/nnedi3_weights.bin /usr/local/share/NNEDI3CL/
-COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
+COPY --from=miscfilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
 COPY --from=removegrain /removegrain/build/libremovegrain.so /usr/local/lib/vapoursynth/
 COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 
-COPY --from=rustBuild /sav1n/target/release/sav1n .
+COPY --from=rustbuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
 ENV PYTHONPATH=/usr/local/lib/python3.13/dist-packages
 ENV VAPOURSYNTH_EXTRA_PLUGIN_PATH=/usr/local/lib/vapoursynth
+RUN x265 --version && \
+    ffmpeg -hide_banner -encoders | grep -q libx265
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'exec python3 -m vapoursynth "$@"' \
