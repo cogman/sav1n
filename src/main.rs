@@ -12,8 +12,7 @@ use crate::frame::Frame;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
-use clap::{App, Arg, ArgMatches};
-use lazy_static::lazy_static;
+use clap::{value_parser, Arg, ArgMatches, Command as ClapCommand};
 use regex::{Captures, Regex};
 use serde_json::Value;
 
@@ -28,7 +27,7 @@ use std::io::Write;
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
 use tokio::fs::{create_dir, remove_dir_all, remove_file};
 use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
@@ -56,12 +55,12 @@ async fn main() {
 
     println!("Encoding {} files", targets.len());
 
-    let encoders = options.value_of_t_or_exit("encoders");
-    let cpu_used = options.value_of_t_or_exit("cpu_used");
-    let vmaf_cpu_used = options.value_of_t_or_exit("vmaf_cpu_used");
-    let vpy: String = options.value_of_t_or_exit("vpy");
-    let vmaf_target: f64 = options.value_of_t_or_exit::<f64>("vmaf_target") / 100.0;
-    let encoder_str: String = options.value_of_t_or_exit::<String>("codec");
+    let encoders = *options.get_one::<usize>("encoders").unwrap();
+    let cpu_used = *options.get_one::<u32>("cpu_used").unwrap();
+    let vmaf_cpu_used = *options.get_one::<u32>("vmaf_cpu_used").unwrap();
+    let vpy: String = options.get_one::<String>("vpy").unwrap().clone();
+    let vmaf_target: f64 = *options.get_one::<f64>("vmaf_target").unwrap() / 100.0;
+    let encoder_str: String = options.get_one::<String>("codec").unwrap().clone();
     let encoder: Arc<dyn Encoder + Send + Sync> = match encoder_str.as_str() {
         "vpx" => Arc::new(Vp9Encoder {}),
         "av1" => Arc::new(Av1Encoder {}),
@@ -547,9 +546,8 @@ async fn vmaf_second_pass(
 
     let (_, ffmpeg_output) = join!(encode.wait(), ffmpeg.wait_with_output());
 
-    lazy_static! {
-        static ref VMAF_RE: Regex = Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap();
-    }
+    static VMAF_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap());
     let results = String::from_utf8(ffmpeg_output.unwrap().stderr).unwrap();
     let captures: Captures = VMAF_RE
         .captures(results.as_str())
@@ -801,8 +799,8 @@ fn start_vspipe(input: &str, vpy: &str, tmp_folder: String) -> Child {
         .unwrap()
 }
 
-fn extract_options() -> ArgMatches {
-    App::new("sav1n")
+fn cli() -> ClapCommand {
+    ClapCommand::new("sav1n")
         .version("0.0.1")
         .author("Thomas May")
         .arg(
@@ -811,17 +809,14 @@ fn extract_options() -> ArgMatches {
                 .long("input")
                 .help("Input file")
                 .required(true)
-                .multiple_values(true)
-                .takes_value(true),
+                .num_args(1..),
         )
         .arg(
             Arg::new("vpy")
                 .short('v')
                 .long("vpy")
                 .help("vapoursynth file")
-                .required(true)
-                .multiple_values(false)
-                .takes_value(true),
+                .required(true),
         )
         .arg(
             Arg::new("encoders")
@@ -829,42 +824,39 @@ fn extract_options() -> ArgMatches {
                 .long("encoders")
                 .help("Number of encoders")
                 .default_value("12")
-                .multiple_values(false)
-                .takes_value(true),
+                .value_parser(value_parser!(usize)),
         )
         .arg(
             Arg::new("vmaf_target")
                 .short('t')
                 .long("vmaf_target")
                 .default_value("95")
-                .multiple_values(false)
-                .takes_value(true),
+                .value_parser(value_parser!(f64)),
         )
         .arg(
             Arg::new("cpu_used")
                 .short('c')
                 .long("cpu_used")
                 .default_value("0")
-                .multiple_values(false)
-                .takes_value(true),
+                .value_parser(value_parser!(u32)),
         )
         .arg(
             Arg::new("vmaf_cpu_used")
                 .long("vmaf_cpu_used")
                 .default_value("3")
-                .multiple_values(false)
-                .takes_value(true),
+                .value_parser(value_parser!(u32)),
         )
         .arg(
             Arg::new("codec")
                 .short('o')
                 .long("codec")
                 .default_value("vpx")
-                .possible_values(["vpx", "av1", "x265"])
-                .multiple_values(false)
-                .takes_value(true),
+                .value_parser(["vpx", "av1", "x265"]),
         )
-        .get_matches()
+}
+
+fn extract_options() -> ArgMatches {
+    cli().get_matches()
 }
 const MI_SIZE_LOG2: u32 = 2;
 
@@ -889,4 +881,93 @@ fn align_power_of_two(value: i32, n: i32) -> i32 {
 struct FrameStats {
     frame_num: u64,
     is_keyframe: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        cli().debug_assert();
+    }
+
+    #[test]
+    fn parses_required_and_default_options() {
+        let matches = cli()
+            .try_get_matches_from(["sav1n", "-i", "one.mkv", "two.mkv", "-v", "script.vpy"])
+            .unwrap();
+
+        let inputs: Vec<&str> = matches
+            .get_many::<String>("input")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(inputs, ["one.mkv", "two.mkv"]);
+        assert_eq!(matches.get_one::<String>("vpy").unwrap(), "script.vpy");
+        assert_eq!(*matches.get_one::<usize>("encoders").unwrap(), 12);
+        assert_eq!(*matches.get_one::<f64>("vmaf_target").unwrap(), 95.0);
+        assert_eq!(*matches.get_one::<u32>("cpu_used").unwrap(), 0);
+        assert_eq!(*matches.get_one::<u32>("vmaf_cpu_used").unwrap(), 3);
+        assert_eq!(matches.get_one::<String>("codec").unwrap(), "vpx");
+    }
+
+    #[test]
+    fn parses_typed_options() {
+        let matches = cli()
+            .try_get_matches_from([
+                "sav1n",
+                "-i",
+                "input.mkv",
+                "-v",
+                "script.vpy",
+                "-e",
+                "4",
+                "-t",
+                "92",
+                "-c",
+                "2",
+                "--vmaf_cpu_used",
+                "5",
+                "-o",
+                "x265",
+            ])
+            .unwrap();
+
+        assert_eq!(*matches.get_one::<usize>("encoders").unwrap(), 4);
+        assert_eq!(*matches.get_one::<f64>("vmaf_target").unwrap(), 92.0);
+        assert_eq!(*matches.get_one::<u32>("cpu_used").unwrap(), 2);
+        assert_eq!(*matches.get_one::<u32>("vmaf_cpu_used").unwrap(), 5);
+        assert_eq!(matches.get_one::<String>("codec").unwrap(), "x265");
+    }
+
+    #[test]
+    fn rejects_unknown_codec() {
+        let result = cli().try_get_matches_from([
+            "sav1n",
+            "-i",
+            "input.mkv",
+            "-v",
+            "script.vpy",
+            "-o",
+            "h264",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_option() {
+        let result = cli().try_get_matches_from([
+            "sav1n",
+            "-i",
+            "input.mkv",
+            "-v",
+            "script.vpy",
+            "-e",
+            "many",
+        ]);
+
+        assert!(result.is_err());
+    }
 }

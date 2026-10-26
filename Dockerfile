@@ -2,7 +2,7 @@
 
 FROM debian:trixie-slim AS runtime
 
-ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu/:/usr/local/lib/vapoursynth
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:/usr/local/lib/x86_64-linux-gnu/:/usr/local/lib/vapoursynth:/usr/local/lib/python3.13/dist-packages/vapoursynth
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -51,12 +51,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     build-essential \
     cmake \
     git \
-    git-core \
     libass-dev \
     libboost-dev \
     libboost-filesystem-dev \
     libfftw3-dev \
-    libfreetype6-dev \
+    libfreetype-dev \
     libtool \
     libva-dev \
     libvdpau-dev \
@@ -65,6 +64,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ocl-icd-opencl-dev \
     perl \
     pkg-config \
+    python3-dev \
     python3-pip \
     texinfo \
     wget \
@@ -73,7 +73,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zlib1g-dev
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 --no-cache-dir install --break-system-packages meson setuptools cython sphinx
+    pip3 --no-cache-dir install --break-system-packages "cython>=3.3" meson setuptools sphinx
 
 ENV CFLAGS "-O3 -march=x86-64-v3 -fPIC"
 ENV CXXFLAGS "-O3 -march=x86-64-v3 -fPIC"
@@ -87,12 +87,44 @@ RUN ./autogen.sh  && \
     make && \
     make install
 
-RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R73 /vapoursynth/build
+RUN git clone https://github.com/vapoursynth/vapoursynth.git --depth=1 -b R81 /vapoursynth/build
 WORKDIR /vapoursynth/build
-RUN ./autogen.sh && \
-    ./configure --enable-shared && \
-    make && \
-    make install
+RUN meson setup /vapoursynth/vs-build --prefix=/usr/local --buildtype=release \
+    -Dpython.purelibdir=/usr/local/lib/python3.13/dist-packages \
+    -Dpython.platlibdir=/usr/local/lib/python3.13/dist-packages && \
+    meson compile -C /vapoursynth/vs-build && \
+    meson install -C /vapoursynth/vs-build
+
+RUN mkdir -p /usr/local/include/vapoursynth && \
+    cp /usr/local/lib/python3.13/dist-packages/vapoursynth/include/*.h /usr/local/include/vapoursynth/ && \
+    printf '%s\n' \
+    'prefix=/usr/local' \
+    'exec_prefix=${prefix}' \
+    'libdir=/usr/local/lib' \
+    'includedir=/usr/local/lib/python3.13/dist-packages/vapoursynth/include' \
+    '' \
+    'Name: vapoursynth' \
+    'Description: A frameserver for the 21st century' \
+    'Version: 81' \
+    'Cflags: -I${includedir}' \
+    > /usr/local/lib/pkgconfig/vapoursynth.pc && \
+    printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /usr/local/lib/python3.13/dist-packages/vapoursynth/vspipe "$@"' \
+    > /usr/local/bin/vspipe && \
+    chmod +x /usr/local/bin/vspipe
+
+RUN mkdir -p /usr/local/lib/vapoursynth /usr/local/lib/python3/dist-packages/vapoursynth && \
+    ln -sfn /usr/local/lib/vapoursynth /usr/local/lib/python3/dist-packages/vapoursynth/plugins && \
+    printf '%s\n' \
+    '#!/bin/sh' \
+    'exec python3 -m vapoursynth "$@"' \
+    > /usr/local/bin/vapoursynth && \
+    chmod +x /usr/local/bin/vapoursynth
+
+FROM vapoursynth AS alicePorts
+RUN git clone https://github.com/AliceTeaParty/vapoursynth-api4-wheels.git /alice && \
+    git -C /alice checkout 0b16c23ddfa15a3dcb72f17007f1ffd9b44b100e
 
 FROM vapoursynth AS miscFilters
 RUN git clone https://github.com/vapoursynth/vs-miscfilters-obsolete.git --depth=1 -b master /vs-misc
@@ -126,13 +158,6 @@ RUN meson build && \
     ninja -C build && \
     ninja -C build install
 
-FROM vapoursynth AS ctmf
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-CTMF.git --depth=1 -b master /ctmf
-WORKDIR /ctmf
-RUN meson build && \
-    ninja -C build && \
-    ninja -C build install
-
 FROM vapoursynth AS dct
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DCTFilter.git --depth=1 -b master /dct
 WORKDIR /dct
@@ -147,16 +172,8 @@ RUN meson build && \
     ninja -C build && \
     ninja -C build install
 
-FROM vapoursynth AS dfttest
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DFTTest.git --depth=1 -b master /dfttest
-WORKDIR /dfttest
-RUN meson build && \
-    ninja -C build && \
-    ninja -C build install
-
-FROM vapoursynth AS eedi2
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-EEDI2.git --depth=1 -b master /eedi2
-WORKDIR /eedi2
+FROM alicePorts AS dfttest
+WORKDIR /alice/plugins/vapoursynth-dfttest
 RUN meson build && \
     ninja -C build && \
     ninja -C build install
@@ -164,7 +181,8 @@ RUN meson build && \
 FROM vapoursynth AS eedi3
 RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-EEDI3.git --depth=1 -b master /eedi3
 WORKDIR /eedi3
-RUN meson build && \
+RUN sed -i '1i #include <cfloat>' EEDI3/EEDI3.cpp EEDI3/EEDI3_SSE4.cpp EEDI3/EEDI3_AVX2.cpp && \
+    meson build && \
     ninja -C build && \
     ninja -C build install
 
@@ -175,62 +193,37 @@ RUN meson build && \
     ninja -C build && \
     ninja -C build install
 
-FROM vapoursynth AS fluxsmooth
-RUN git clone https://github.com/dubhater/vapoursynth-fluxsmooth.git --depth=1 -b master /fluxsmooth
-WORKDIR /fluxsmooth
-RUN ./autogen.sh && \
-    ./configure && \
-    make
-
 FROM vapoursynth AS fmtconv
-RUN git clone https://github.com/EleonoreMizo/fmtconv.git --depth=1 -b master /fmtconv
+RUN git clone https://github.com/AmusementClub/fmtconv.git --depth=1 -b master /fmtconv
 WORKDIR /fmtconv/build/unix
 RUN ./autogen.sh && \
     ./configure && \
     make
 
-FROM vapoursynth AS hqdn3d
-RUN git clone https://github.com/Hinterwaeldlers/vapoursynth-hqdn3d.git --depth=1 -b master /hqdn3d
-WORKDIR /hqdn3d
-RUN ./autogen.sh && \
-    ./configure && \
-    make
-
 FROM vapoursynth AS knlmeanscl
-RUN git clone https://github.com/Khanattila/KNLMeansCL.git --depth=1 -b master /knlmeanscl
+RUN git clone https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeanscl.git --depth=1 -b master /knlmeanscl
 WORKDIR /knlmeanscl
 RUN meson build && \
-    ninja -C build && \
-    ninja -C build install
+    ninja -C build
 
 FROM vapoursynth AS mvtools
 RUN git clone https://github.com/dubhater/vapoursynth-mvtools.git --depth=1 -b master /mvtools
 WORKDIR /mvtools
-RUN meson build && \
+RUN sed -i 's/#include <cmath>/#include <cmath>\n#include <math.h>/' src/MVDepan.cpp && \
+    meson build && \
     ninja -C build
 
-FROM vapoursynth AS nnedi3
-RUN git clone https://github.com/dubhater/vapoursynth-nnedi3.git --depth=1 -b master /nnedi3
-WORKDIR /nnedi3
-RUN ./autogen.sh && \
-    ./configure && \
-    make
-
-FROM vapoursynth AS nnedi3cl
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/VapourSynth-NNEDI3CL.git --depth=1 -b master /nnedi3cl
-WORKDIR /nnedi3cl
+FROM alicePorts AS nnedi3cl
+WORKDIR /alice/plugins/vapoursynth-nnedi3cl
 RUN meson build && \
-    ninja -C build
+    ninja -C build && \
+    ninja -C build install && \
+    mkdir -p /usr/local/share/NNEDI3CL && \
+    cp NNEDI3CL/nnedi3_weights.bin /usr/local/share/NNEDI3CL/
 
 FROM vapoursynth AS sangnom
 RUN git clone https://github.com/dubhater/vapoursynth-sangnom.git --depth=1 -b master /sangnom
 WORKDIR /sangnom
-RUN meson build && \
-    ninja -C build
-
-FROM vapoursynth AS temporalsoften2
-RUN git clone https://github.com/dubhater/vapoursynth-temporalsoften2.git --depth=1 -b master /temporalsoften2
-WORKDIR /temporalsoften2
 RUN meson build && \
     ninja -C build
 
@@ -243,56 +236,53 @@ RUN meson build && \
 FROM vapoursynth AS znedi3
 RUN git clone https://github.com/sekrit-twc/znedi3.git -n /znedi3
 WORKDIR /znedi3
-RUN git checkout 4090c5c3899be7560380e0420122ac9097ef9e8e && \
+RUN git checkout 34b2aa9f5d10c31775469b7a358f1ff52375ed1e && \
     git submodule init && \
     git submodule update --recursive
 RUN make x86=1
 
-FROM vapoursynth AS tonemap
-RUN git clone https://github.com/ifb/vapoursynth-tonemap.git --depth=1 -b master /tonemap
-WORKDIR /tonemap
-RUN ./autogen.sh && \
-    ./configure && \
-    make
-
 FROM vapoursynth AS HAvsFunc
 RUN git clone https://github.com/dubhater/vapoursynth-adjust.git --depth=1 -b master /adjust
-RUN mv /adjust/adjust.py /usr/local/lib/python3.13/site-packages
+RUN mv /adjust/adjust.py /usr/local/lib/python3.13/dist-packages
 
 RUN git clone https://github.com/AmusementClub/mvsfunc.git --depth=1 -b mod /mvsfunc
-RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.13/site-packages
+RUN mv /mvsfunc/mvsfunc.py /usr/local/lib/python3.13/dist-packages
 
 RUN git clone https://github.com/mawen1250/VapourSynth-script.git --depth=1 -b master /nnedi3_resample
-RUN mv /nnedi3_resample/nnedi3_resample.py /usr/local/lib/python3.13/site-packages
+RUN mv /nnedi3_resample/nnedi3_resample.py /usr/local/lib/python3.13/dist-packages
 
 RUN git clone https://github.com/Irrational-Encoding-Wizardry/vsutil.git --depth=1 -b master /vsutil
-RUN mv /vsutil/vsutil /usr/local/lib/python3.13/site-packages
+RUN mv /vsutil/vsutil /usr/local/lib/python3.13/dist-packages
 
-RUN git clone https://github.com/HomeOfVapourSynthEvolution/havsfunc.git --depth=1 -b master /havsfunc
-RUN mv /havsfunc/havsfunc/havsfunc.py /usr/local/lib/python3.13/site-packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 --no-cache-dir install --break-system-packages --no-deps --target /vspython \
+    havsfunc \
+    vsjetpack \
+    jetpytools \
+    numpy \
+    psutil \
+    rich \
+    markdown-it-py \
+    mdurl \
+    typing_extensions \
+    vapoursynth-akarin \
+    vapoursynth-vszip
 
 COPY --from=addGrain /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=vcas /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=ctmf /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=dct /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=deblock /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=dfttest /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=eedi2 /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
+COPY --from=dfttest /alice/plugins/vapoursynth-dfttest/build/*.so /usr/local/lib/vapoursynth
 COPY --from=eedi3 /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
 COPY --from=fft3dfilter /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=fluxsmooth /fluxsmooth/.libs/*.so /usr/local/lib/vapoursynth
 COPY --from=fmtconv /fmtconv/build/unix/.libs/*.so /usr/local/lib/vapoursynth
-COPY --from=hqdn3d /hqdn3d/.libs/*.so /usr/local/lib/vapoursynth
 COPY --from=knlmeanscl /knlmeanscl/build/*.so /usr/local/lib/vapoursynth
 COPY --from=mvtools /mvtools/build/*.so /usr/local/lib/vapoursynth
-COPY --from=nnedi3 /nnedi3/.libs/*.so /usr/local/lib/vapoursynth
-COPY --from=nnedi3cl /nnedi3cl/build/*.so /usr/local/lib/vapoursynth
+COPY --from=nnedi3cl /alice/plugins/vapoursynth-nnedi3cl/build/*.so /usr/local/lib/vapoursynth
 COPY --from=sangnom /sangnom/build/*.so /usr/local/lib/vapoursynth
-COPY --from=temporalsoften2 /temporalsoften2/build/*.so /usr/local/lib/vapoursynth
 COPY --from=ttempsmooth /ttempsmooth/build/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/lib/vapoursynth
-COPY --from=tonemap /tonemap/.libs/*.so /usr/local/lib/vapoursynth
 
 FROM build AS aom
 RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b master /aom
@@ -321,10 +311,10 @@ RUN git -C opus pull 2> /dev/null || git clone --depth 1 https://github.com/xiph
 
 FROM build AS vmaf
 WORKDIR /vmaf
-RUN wget https://github.com/Netflix/vmaf/archive/v3.0.0.tar.gz && \
-    tar xvf v3.0.0.tar.gz
-RUN mkdir -p vmaf-3.0.0/libvmaf/build &&\
-    cd vmaf-3.0.0/libvmaf/build && \
+RUN wget https://github.com/Netflix/vmaf/archive/v3.2.1.tar.gz && \
+    tar xvf v3.2.1.tar.gz
+RUN mkdir -p vmaf-3.2.1/libvmaf/build &&\
+    cd vmaf-3.2.1/libvmaf/build && \
     meson setup -Denable_tests=false -Denable_docs=false --buildtype=release .. && \
     ninja -v 2>&1 && \
     ninja install
@@ -371,7 +361,7 @@ COPY --from=vpx /usr/local/include /usr/local/include
 COPY --from=vpx /usr/local/lib /usr/local/lib
 
 WORKDIR /ffmpeg
-RUN git clone --branch 'release/8.0' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
+RUN git clone --branch 'release/8.1' https://github.com/FFmpeg/FFmpeg.git --depth 1 ffmpeg  && \
     cd ffmpeg && \
     ./configure \
     --disable-doc \
@@ -422,13 +412,12 @@ FROM runtime
 WORKDIR /sav1n
 
 COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib/
-#COPY --from=vapoursynth /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth
-COPY --from=vapoursynth /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=vapoursynth /usr/local/lib/python3.13/dist-packages /usr/local/lib/python3.13/dist-packages
 
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin/
 COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin/
 COPY --from=x265 /usr/local/bin/x265 /usr/local/bin/
-COPY --from=vmaf /vmaf/vmaf-3.0.0/model/vmaf_v0.6.1.json /usr/local/share/model/
+COPY --from=vmaf /vmaf/vmaf-3.2.1/model/vmaf_v0.6.1.json /usr/local/share/model/
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
@@ -437,10 +426,12 @@ COPY --from=ffmpeg /usr/local/lib/x86_64-linux-gnu/*.so* /usr/local/lib/x86_64-l
 COPY --from=ffms2 /ffms2/src/core/.libs/libffms2.so /usr/local/lib/vapoursynth/
 COPY --from=lsmash /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=lsmash /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
-COPY --from=HAvsFunc /usr/local/lib/python3.13/site-packages/*.py /usr/local/lib/python3.13/site-packages/
-COPY --from=HAvsFunc /usr/local/lib/python3.13/site-packages/vsutil/ /usr/local/lib/python3.13/site-packages/vsutil/
+COPY --from=HAvsFunc /usr/local/lib/python3.13/dist-packages/*.py /usr/local/lib/python3.13/dist-packages/
+COPY --from=HAvsFunc /usr/local/lib/python3.13/dist-packages/vsutil/ /usr/local/lib/python3.13/dist-packages/vsutil/
+COPY --from=HAvsFunc /vspython/ /usr/local/lib/python3.13/dist-packages/
 COPY --from=HAvsFunc /usr/local/lib/vapoursynth /usr/local/lib/vapoursynth/
-COPY --from=nnedi3 /nnedi3/src/nnedi3_weights.bin /usr/local/share/nnedi3/
+COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/share/nnedi3/
+COPY --from=nnedi3cl /usr/local/share/NNEDI3CL/nnedi3_weights.bin /usr/local/share/NNEDI3CL/
 COPY --from=miscFilters /vs-misc/build/libmiscfilters.so /usr/local/lib/vapoursynth/
 COPY --from=removegrain /removegrain/build/libremovegrain.so /usr/local/lib/vapoursynth/
 COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
@@ -448,7 +439,14 @@ COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 COPY --from=rustBuild /sav1n/target/release/sav1n .
 
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
-ENV PYTHONPATH=/usr/local/lib/python3.13/site-packages
+ENV PYTHONPATH=/usr/local/lib/python3.13/dist-packages
+ENV VAPOURSYNTH_EXTRA_PLUGIN_PATH=/usr/local/lib/vapoursynth
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec python3 -m vapoursynth "$@"' \
+    > /usr/local/bin/vapoursynth && \
+    chmod +x /usr/local/bin/vapoursynth && \
+    python3 -m vapoursynth config
 RUN mkdir -p /etc/OpenCL/vendors && \
     echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 ENV NVIDIA_VISIBLE_DEVICES=all
