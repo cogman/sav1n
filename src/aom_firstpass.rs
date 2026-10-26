@@ -1,7 +1,42 @@
 pub mod aom {
-    use core::mem;
     use std::collections::VecDeque;
+    use std::io::ErrorKind;
     use tokio::io::{AsyncRead, AsyncReadExt, Error};
+
+    /// Record layout used by the aomenc that produced the stats log.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum FirstpassFormat {
+        /// libaom before v3.7: 27 fields, no log_* or lt_coded_error.
+        V3_6,
+        /// libaom v3.7 through v3.13: 29 fields, adds log_intra_error and log_coded_error.
+        V3_7,
+        /// libaom v3.14 and later: 30 fields, adds lt_coded_error.
+        V3_14,
+    }
+
+    impl FirstpassFormat {
+        pub fn record_size(self) -> usize {
+            match self {
+                FirstpassFormat::V3_6 => 27 * 8,
+                FirstpassFormat::V3_7 => 29 * 8,
+                FirstpassFormat::V3_14 => 30 * 8,
+            }
+        }
+
+        pub fn has_lt_coded_error(self) -> bool {
+            self == FirstpassFormat::V3_14
+        }
+
+        fn decode(self, record: &[u8; 30 * 8]) -> AomFirstpass {
+            let mut bytes = [0u8; 30 * 8];
+            bytes[..self.record_size()].copy_from_slice(&record[..self.record_size()]);
+            if !self.has_lt_coded_error() {
+                bytes.copy_within(6 * 8..self.record_size(), 7 * 8);
+                bytes[6 * 8..7 * 8].fill(0);
+            }
+            unsafe { std::mem::transmute(bytes) }
+        }
+    }
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -143,6 +178,7 @@ pub mod aom {
     }
 
     impl AomFirstpass {
+        #[cfg(test)]
         fn empty() -> AomFirstpass {
             AomFirstpass {
                 frame: 0.0,
@@ -180,16 +216,57 @@ pub mod aom {
 
         pub async fn read_aom_firstpass(
             reader: &mut (impl AsyncRead + Unpin),
+            format: FirstpassFormat,
         ) -> Result<AomFirstpass, Error> {
-            let mut firstpass = AomFirstpass::empty();
-            unsafe {
-                let buffer: &mut [u8] = std::slice::from_raw_parts_mut(
-                    &mut firstpass as *mut AomFirstpass as *mut u8,
-                    mem::size_of::<AomFirstpass>(),
-                );
-                reader.read_exact(buffer).await?;
+            let mut record = [0u8; 30 * 8];
+            reader
+                .read_exact(&mut record[..format.record_size()])
+                .await?;
+            Ok(format.decode(&record))
+        }
+
+        pub async fn detect_format(file: &mut tokio::fs::File) -> Result<FirstpassFormat, Error> {
+            let len = file.metadata().await?.len();
+            let mut head = [0u8; 30 * 8];
+            file.read_exact(&mut head).await?;
+            Self::detect_format_from_head(&head, len).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "unsupported AOM first pass stats layout",
+                )
+            })
+        }
+
+        fn detect_format_from_head(head: &[u8], len: u64) -> Option<FirstpassFormat> {
+            let field = |index: usize| {
+                f64::from_ne_bytes(head[index * 8..index * 8 + 8].try_into().unwrap())
+            };
+            if field(0) != 0.0 {
+                return None;
             }
-            Ok(firstpass)
+            // `count` is 1.0 on the first record; it moves from field 22 to 23
+            // when v3.14 inserts lt_coded_error.
+            let old_count = field(22) == 1.0;
+            let new_count = field(23) == 1.0;
+            if new_count && !old_count {
+                return Some(FirstpassFormat::V3_14);
+            }
+            if !old_count {
+                return new_count.then_some(FirstpassFormat::V3_14);
+            }
+            if field(27) == 1.0 {
+                Some(FirstpassFormat::V3_6)
+            } else if field(29) == 1.0 {
+                Some(FirstpassFormat::V3_7)
+            } else if len.is_multiple_of(FirstpassFormat::V3_6.record_size() as u64)
+                && !len.is_multiple_of(FirstpassFormat::V3_7.record_size() as u64)
+            {
+                Some(FirstpassFormat::V3_6)
+            } else if len.is_multiple_of(FirstpassFormat::V3_7.record_size() as u64) {
+                Some(FirstpassFormat::V3_7)
+            } else {
+                None
+            }
         }
 
         fn second_ref_usage_thresh(frame_count_so_far: u64) -> f64 {
@@ -220,6 +297,7 @@ pub mod aom {
             future_frames: &VecDeque<AomFirstpass>,
             frame_since_last_scene: u64,
             num_mbs: u32,
+            format: FirstpassFormat,
         ) -> bool {
             let next_stats = future_frames[0];
 
@@ -260,9 +338,10 @@ pub mod aom {
                 {
                     j = i + 1;
 
-                    if (local_next_frame.intra_error - self.intra_error)
-                        / Self::double_divide_check(self.intra_error)
-                        > 0.1
+                    if format.has_lt_coded_error()
+                        && (local_next_frame.intra_error - self.intra_error)
+                            / Self::double_divide_check(self.intra_error)
+                            > 0.1
                         && self.coded_error > local_next_frame.coded_error * 6.0
                     {
                         break;
@@ -356,7 +435,13 @@ pub mod aom {
             let future_frames: VecDeque<_> = (11..15)
                 .map(|frame| predictable_future(frame as f64))
                 .collect();
-            assert!(scene_candidate().test_candidate_kf(&base_stats(9.0), &future_frames, 10, 100));
+            assert!(scene_candidate().test_candidate_kf(
+                &base_stats(9.0),
+                &future_frames,
+                10,
+                100,
+                FirstpassFormat::V3_14,
+            ));
         }
 
         #[test]
@@ -372,6 +457,24 @@ pub mod aom {
                 &future_frames,
                 10,
                 100,
+                FirstpassFormat::V3_14,
+            ));
+        }
+
+        #[test]
+        fn older_stats_keep_scanning_past_error_spike() {
+            let mut spike = predictable_future(11.0);
+            spike.intra_error = 2000.0;
+            spike.coded_error = 100.0;
+            let mut future_frames = VecDeque::from([spike]);
+            future_frames.extend((12..15).map(|frame| predictable_future(frame as f64)));
+
+            assert!(scene_candidate().test_candidate_kf(
+                &base_stats(9.0),
+                &future_frames,
+                10,
+                100,
+                FirstpassFormat::V3_6,
             ));
         }
 
@@ -388,12 +491,99 @@ pub mod aom {
             early_signal.coded_error = 30.0;
             assert!(!candidate.should_test_next_gop(&VecDeque::from([early_signal])));
         }
+
+        fn encoded_record(format: FirstpassFormat) -> [u8; 30 * 8] {
+            let mut record = [0u8; 30 * 8];
+            let values: Vec<f64> = (0..30)
+                .map(|index| index as f64 + 1.0)
+                .filter(|value| {
+                    !(format != FirstpassFormat::V3_14 && *value == 7.0)
+                        && !(format == FirstpassFormat::V3_6 && *value >= 29.0)
+                })
+                .collect();
+            assert_eq!(values.len() * 8, format.record_size());
+            for (index, value) in values.iter().enumerate() {
+                record[index * 8..index * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+            }
+            record
+        }
+
+        #[test]
+        fn decodes_every_stats_layout() {
+            for format in [
+                FirstpassFormat::V3_6,
+                FirstpassFormat::V3_7,
+                FirstpassFormat::V3_14,
+            ] {
+                let decoded = format.decode(&encoded_record(format));
+                assert_eq!(decoded.frame, 1.0);
+                assert_eq!(decoded.sr_coded_error, 6.0);
+                assert_eq!(decoded.pcnt_inter, 8.0);
+                assert_eq!(decoded.inactive_zone_cols, 14.0);
+                assert_eq!(decoded.cor_coeff, 28.0);
+                if format.has_lt_coded_error() {
+                    assert_eq!(decoded.lt_coded_error, 7.0);
+                    assert_eq!(decoded.log_coded_error, 30.0);
+                } else {
+                    assert_eq!(decoded.lt_coded_error, 0.0);
+                }
+                if format == FirstpassFormat::V3_6 {
+                    assert_eq!(decoded.log_intra_error, 0.0);
+                    assert_eq!(decoded.log_coded_error, 0.0);
+                } else {
+                    assert_eq!(decoded.log_intra_error, 29.0);
+                    assert_eq!(decoded.log_coded_error, 30.0);
+                }
+            }
+        }
+
+        fn head_with(fields: &[(usize, f64)]) -> [u8; 30 * 8] {
+            let mut head = [0u8; 30 * 8];
+            for (index, value) in fields {
+                head[index * 8..index * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+            }
+            head
+        }
+
+        #[test]
+        fn detects_stats_layout_from_first_record() {
+            let v3_6 = head_with(&[(22, 1.0), (27, 1.0)]);
+            assert_eq!(
+                AomFirstpass::detect_format_from_head(&v3_6, 0),
+                Some(FirstpassFormat::V3_6)
+            );
+
+            let v3_7 = head_with(&[(22, 1.0), (29, 1.0)]);
+            assert_eq!(
+                AomFirstpass::detect_format_from_head(&v3_7, 0),
+                Some(FirstpassFormat::V3_7)
+            );
+
+            let v3_14 = head_with(&[(22, 416_666.0), (23, 1.0)]);
+            assert_eq!(
+                AomFirstpass::detect_format_from_head(&v3_14, 0),
+                Some(FirstpassFormat::V3_14)
+            );
+        }
+
+        #[test]
+        fn falls_back_to_log_length_for_single_frame_clips() {
+            let head = head_with(&[(22, 1.0)]);
+            assert_eq!(
+                AomFirstpass::detect_format_from_head(&head, 27 * 8 * 2),
+                Some(FirstpassFormat::V3_6)
+            );
+            assert_eq!(
+                AomFirstpass::detect_format_from_head(&head, 29 * 8 * 2),
+                Some(FirstpassFormat::V3_7)
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::aom_firstpass::aom::AomFirstpass;
+    use crate::aom_firstpass::aom::{AomFirstpass, FirstpassFormat};
     use std::io::Cursor;
 
     #[test]
@@ -408,10 +598,10 @@ mod tests {
         data[..8].copy_from_slice(&0.0f64.to_ne_bytes());
         data[record_size..record_size + 8].copy_from_slice(&1.0f64.to_ne_bytes());
         let mut test_file = Cursor::new(data);
-        let frame1 = AomFirstpass::read_aom_firstpass(&mut test_file)
+        let frame1 = AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14)
             .await
             .unwrap();
-        let frame2 = AomFirstpass::read_aom_firstpass(&mut test_file)
+        let frame2 = AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14)
             .await
             .unwrap();
 

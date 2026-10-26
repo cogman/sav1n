@@ -23,14 +23,14 @@ use crate::x265_encoder::X265Encoder;
 use glob::glob;
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::io::Write;
+use std::io::{SeekFrom, Write};
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
 use tokio::fs::{create_dir, remove_dir_all, remove_file};
-use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader, ErrorKind};
 use tokio::join;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -658,21 +658,29 @@ fn stats_processor(
     task::spawn(async move {
         delayed_aom.acquire_many(112).await.unwrap().forget();
         let mut frame_stats = VecDeque::new();
-        let mut keyframe = BufReader::with_capacity(
-            1024,
-            File::open(format!("{}/keyframe.log", tmp_folder).as_str())
-                .await
-                .unwrap(),
-        );
-        let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe)
+        let mut keyframe_file = File::open(format!("{}/keyframe.log", tmp_folder).as_str())
+            .await
+            .unwrap();
+        let format = AomFirstpass::detect_format(&mut keyframe_file)
+            .await
+            .expect("Unsupported AOM first pass stats layout");
+        keyframe_file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut keyframe = BufReader::with_capacity(1024, keyframe_file);
+        let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe, format)
             .await
             .unwrap();
         let mut last = current;
+        let mut reached_end = false;
         // Fill up the frame buffer
         while frame_stats.len() < 32 {
-            match AomFirstpass::read_aom_firstpass(&mut keyframe).await {
+            match AomFirstpass::read_aom_firstpass(&mut keyframe, format).await {
                 Ok(stat) => frame_stats.push_back(stat),
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    // aomenc ends the log with a whole-clip summary record.
+                    frame_stats.pop_back();
+                    reached_end = true;
+                    break;
+                }
                 Err(e) => panic!("Exploded unexpectedly! {}", e),
             }
         }
@@ -680,10 +688,17 @@ fn stats_processor(
         let num_mbs = mbs(video_header.width, video_header.height);
         loop {
             delayed_aom.acquire().await.unwrap().forget();
-            if since_last_keyframe >= 1000
-                || (current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs)
-                    && !current.should_test_next_gop(&frame_stats))
-            {
+            let scene_cut = !reached_end
+                && !frame_stats.is_empty()
+                && current.test_candidate_kf(
+                    &last,
+                    &frame_stats,
+                    since_last_keyframe,
+                    num_mbs,
+                    format,
+                )
+                && (!format.has_lt_coded_error() || !current.should_test_next_gop(&frame_stats));
+            if since_last_keyframe >= 1000 || scene_cut {
                 let _ = stats_tx
                     .send(FrameStats {
                         frame_num: current.frame as u64,
@@ -705,33 +720,23 @@ fn stats_processor(
                 break;
             };
             current = next;
-            let stats = AomFirstpass::read_aom_firstpass(&mut keyframe).await;
-            match stats {
+            if reached_end {
+                continue;
+            }
+            match AomFirstpass::read_aom_firstpass(&mut keyframe, format).await {
                 Ok(stat) => frame_stats.push_back(stat),
                 Err(e) => {
                     if e.kind() == ErrorKind::UnexpectedEof {
-                        let _ = stats_tx
-                            .send(FrameStats {
-                                frame_num: current.frame as u64,
-                                is_keyframe: false,
-                            })
-                            .await;
-                        for stats in frame_stats {
-                            let _ = stats_tx
-                                .send(FrameStats {
-                                    frame_num: stats.frame as u64,
-                                    is_keyframe: false,
-                                })
-                                .await;
-                        }
-                        drop(stats_tx);
-                        break;
+                        // aomenc ends the log with a whole-clip summary record.
+                        frame_stats.pop_back();
+                        reached_end = true;
                     } else {
                         panic!("Exploded unexpectedly! {}", e)
                     }
                 }
             }
         }
+        drop(stats_tx);
     })
 }
 
