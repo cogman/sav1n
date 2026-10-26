@@ -27,6 +27,7 @@ use std::io::{SeekFrom, Write};
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
 use tokio::fs::{create_dir, remove_dir_all, remove_file};
@@ -130,10 +131,16 @@ async fn compress_file(
     let buffer = Arc::new(FrameBuffer::new(129, header.clone()));
 
     let delayed_aom = analyzed_aom_frames.clone();
+    let aom_finished = Arc::new(AtomicBool::new(false));
     let (stats_tx, stats_rx) = mpsc::channel(129);
 
-    let frame_stats_processor =
-        stats_processor(header.clone(), delayed_aom, stats_tx, tmp_folder.clone());
+    let frame_stats_processor = stats_processor(
+        header.clone(),
+        delayed_aom,
+        aom_finished.clone(),
+        stats_tx,
+        tmp_folder.clone(),
+    );
 
     let container_format = encoder.container_format();
     let processing = process(
@@ -151,6 +158,7 @@ async fn compress_file(
     let aom_first_pass_scene = aom_firstpass_for_scene_detection(
         header,
         analyzed_aom_frames,
+        aom_finished,
         buffer.clone(),
         tmp_folder.clone(),
     );
@@ -652,6 +660,7 @@ async fn vmaf_secant_search(
 fn stats_processor(
     video_header: VideoHeader,
     delayed_aom: Arc<Semaphore>,
+    aom_finished: Arc<AtomicBool>,
     stats_tx: mpsc::Sender<FrameStats>,
     tmp_folder: String,
 ) -> JoinHandle<()> {
@@ -661,19 +670,19 @@ fn stats_processor(
         let mut keyframe_file = File::open(format!("{}/keyframe.log", tmp_folder).as_str())
             .await
             .unwrap();
-        let format = AomFirstpass::detect_format(&mut keyframe_file)
+        let format = AomFirstpass::detect_format(&mut keyframe_file, &aom_finished)
             .await
             .expect("Unsupported AOM first pass stats layout");
         keyframe_file.seek(SeekFrom::Start(0)).await.unwrap();
         let mut keyframe = BufReader::with_capacity(1024, keyframe_file);
-        let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe, format)
+        let mut current = AomFirstpass::read_aom_firstpass(&mut keyframe, format, &aom_finished)
             .await
             .unwrap();
         let mut last = current;
         let mut reached_end = false;
         // Fill up the frame buffer
         while frame_stats.len() < 32 {
-            match AomFirstpass::read_aom_firstpass(&mut keyframe, format).await {
+            match AomFirstpass::read_aom_firstpass(&mut keyframe, format, &aom_finished).await {
                 Ok(stat) => frame_stats.push_back(stat),
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                     // aomenc ends the log with a whole-clip summary record.
@@ -723,7 +732,7 @@ fn stats_processor(
             if reached_end {
                 continue;
             }
-            match AomFirstpass::read_aom_firstpass(&mut keyframe, format).await {
+            match AomFirstpass::read_aom_firstpass(&mut keyframe, format, &aom_finished).await {
                 Ok(stat) => frame_stats.push_back(stat),
                 Err(e) => {
                     if e.kind() == ErrorKind::UnexpectedEof {
@@ -743,6 +752,7 @@ fn stats_processor(
 fn aom_firstpass_for_scene_detection(
     video_header: VideoHeader,
     analyzed_aom_frames: Arc<Semaphore>,
+    aom_finished: Arc<AtomicBool>,
     writing_buf: Arc<FrameBuffer>,
     tmp_folder: String,
 ) -> JoinHandle<()> {
@@ -763,6 +773,7 @@ fn aom_firstpass_for_scene_detection(
                 // Drop input at this point to kill the pipe and cause AOM to flush
                 drop(aom_input);
                 aom.wait().await.expect("AOM crashed");
+                aom_finished.store(true, Ordering::Release);
                 // Allows for the stats to process to the end
                 analyzed_aom_frames.add_permits(99999);
                 break;

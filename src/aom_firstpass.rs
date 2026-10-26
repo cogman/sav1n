@@ -1,6 +1,8 @@
 pub mod aom {
     use std::collections::VecDeque;
     use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, Error};
 
     /// Record layout used by the aomenc that produced the stats log.
@@ -214,21 +216,25 @@ pub mod aom {
             }
         }
 
+        /// Reads the next record of a stats log that aomenc may still be writing.
+        /// Reaching the end of the log only counts as EOF once `finished` is set.
         pub async fn read_aom_firstpass(
             reader: &mut (impl AsyncRead + Unpin),
             format: FirstpassFormat,
+            finished: &AtomicBool,
         ) -> Result<AomFirstpass, Error> {
             let mut record = [0u8; 30 * 8];
-            reader
-                .read_exact(&mut record[..format.record_size()])
-                .await?;
+            read_growing(reader, &mut record[..format.record_size()], finished).await?;
             Ok(format.decode(&record))
         }
 
-        pub async fn detect_format(file: &mut tokio::fs::File) -> Result<FirstpassFormat, Error> {
-            let len = file.metadata().await?.len();
+        pub async fn detect_format(
+            file: &mut tokio::fs::File,
+            finished: &AtomicBool,
+        ) -> Result<FirstpassFormat, Error> {
             let mut head = [0u8; 30 * 8];
-            file.read_exact(&mut head).await?;
+            read_growing(file, &mut head, finished).await?;
+            let len = file.metadata().await?.len();
             Self::detect_format_from_head(&head, len).ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidData,
@@ -403,10 +409,29 @@ pub mod aom {
         }
     }
 
+    async fn read_growing(
+        reader: &mut (impl AsyncRead + Unpin),
+        buf: &mut [u8],
+        finished: &AtomicBool,
+    ) -> Result<(), Error> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let was_finished = finished.load(Ordering::Acquire);
+            match reader.read(&mut buf[filled..]).await? {
+                0 if was_finished => return Err(ErrorKind::UnexpectedEof.into()),
+                0 => tokio::time::sleep(Duration::from_millis(10)).await,
+                read => filled += read,
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use std::collections::VecDeque;
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
 
         fn base_stats(frame: f64) -> AomFirstpass {
             let mut stats = AomFirstpass::empty();
@@ -578,6 +603,39 @@ pub mod aom {
                 Some(FirstpassFormat::V3_7)
             );
         }
+
+        #[tokio::test]
+        async fn waits_for_records_still_being_written() {
+            let path =
+                std::env::temp_dir().join(format!("sav1n-growing-{}.log", std::process::id()));
+            let mut writer = tokio::fs::File::create(&path).await.unwrap();
+            let mut reader = tokio::fs::File::open(&path).await.unwrap();
+            let format = FirstpassFormat::V3_7;
+            let finished = Arc::new(AtomicBool::new(false));
+            let record = encoded_record(format);
+            let writing = {
+                let finished = finished.clone();
+                tokio::spawn(async move {
+                    for chunk in record[..format.record_size()].chunks(100) {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        writer.write_all(chunk).await.unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    finished.store(true, Ordering::Release);
+                })
+            };
+
+            let stats = AomFirstpass::read_aom_firstpass(&mut reader, format, &finished)
+                .await
+                .unwrap();
+            assert_eq!(stats.frame, 1.0);
+            assert_eq!(stats.log_coded_error, 30.0);
+
+            writing.await.unwrap();
+            let end = AomFirstpass::read_aom_firstpass(&mut reader, format, &finished).await;
+            assert!(matches!(end, Err(e) if e.kind() == ErrorKind::UnexpectedEof));
+            tokio::fs::remove_file(&path).await.unwrap();
+        }
     }
 }
 
@@ -585,6 +643,7 @@ pub mod aom {
 mod tests {
     use crate::aom_firstpass::aom::{AomFirstpass, FirstpassFormat};
     use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_firstpass_size_matches_aom() {
@@ -598,12 +657,15 @@ mod tests {
         data[..8].copy_from_slice(&0.0f64.to_ne_bytes());
         data[record_size..record_size + 8].copy_from_slice(&1.0f64.to_ne_bytes());
         let mut test_file = Cursor::new(data);
-        let frame1 = AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14)
-            .await
-            .unwrap();
-        let frame2 = AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14)
-            .await
-            .unwrap();
+        let finished = AtomicBool::new(true);
+        let frame1 =
+            AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14, &finished)
+                .await
+                .unwrap();
+        let frame2 =
+            AomFirstpass::read_aom_firstpass(&mut test_file, FirstpassFormat::V3_14, &finished)
+                .await
+                .unwrap();
 
         assert_eq!(0.0, frame1.frame);
         assert_eq!(1.0, frame2.frame);
