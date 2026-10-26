@@ -15,4 +15,9 @@ make
 make install DESTDIR=../../kcov-build
 cd ../..
 rm -rf "kcov-${KCOV_VERSION}" kcov.tar.gz
-for file in target/debug/deps/sav1n-*; do [ -x "${file}" ] || continue; mkdir -p "target/cov/$(basename $file)"; ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file"; done
+for file in target/debug/deps/sav1n-*; do
+    [ -x "${file}" ] || continue
+    "${file}" --list 2>/dev/null | grep ': test$' >/dev/null || continue
+    mkdir -p "target/cov/$(basename "$file")"
+    ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib "target/cov/$(basename "$file")" "$file"
+done
