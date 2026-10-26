@@ -1,13 +1,12 @@
-use crate::frame::{Frame, Status};
+use crate::frame::{Frame, FramePool, Status};
 use crate::video_header::VideoHeader;
 use std::alloc::Layout;
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::pin;
+use std::sync::{Arc, Mutex};
 use tokio::io;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
-use tokio::time::timeout;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Internal entry that holds a frame together with its semaphore permit.
 /// The permit is kept so that when the entry is dropped (e.g., on pop),
@@ -25,13 +24,15 @@ pub struct FrameBufferData {
 
 pub struct FrameBuffer {
     video_header: VideoHeader,
-    data: RwLock<FrameBufferData>,
+    // Never held across an await, so a std mutex is cheaper than an async lock.
+    data: Mutex<FrameBufferData>,
     frame_layout: Layout,
     frame_size: usize,
     frames_len: usize,
     wait_for_frame: Notify,
     // Semaphore that limits the number of stored frames to `frames_len`.
     semaphore: Arc<Semaphore>,
+    pool: Arc<FramePool>,
 }
 
 impl<'a> FrameBuffer {
@@ -50,46 +51,57 @@ impl<'a> FrameBuffer {
         };
 
         let frame_buffer = FrameBuffer {
-            data: RwLock::new(buffer),
+            data: Mutex::new(buffer),
             video_header,
             frames_len: frames,
             frame_size,
             frame_layout,
             wait_for_frame: Notify::new(),
             semaphore: Arc::new(Semaphore::new(frames)),
+            pool: Arc::new(FramePool::default()),
         };
 
         frame_buffer
     }
 
     pub async fn add_frame(&self, frame: Frame) {
-        // Acquire a permit before inserting. This will block if the buffer is full.
+        // Acquire a permit before taking the lock. This will block if the buffer is full.
         let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-        let entry = BufferEntry {
+        let mut w = self.data.lock().unwrap();
+        w.frame_number = frame.num + 1;
+        w.frames.push_back(BufferEntry {
             frame: Arc::new(frame),
             _permit: permit,
-        };
-        self.data.write().await.frames.push_front(entry);
+        });
+        drop(w);
         self.wait_for_frame.notify_waiters();
     }
 
+    /// Returns the requested frame, waiting for it to be read in if necessary.
+    /// Returns `None` once the input has ended and `frame_num` is past the last frame.
     pub async fn get_frame(&self, frame_num: u64) -> Option<Arc<Frame>> {
         loop {
-            let d = self.data.read().await;
-            let front = d.frames.front();
-            let finished = d.finished;
-            if finished {
-                return None;
-            }
-            if let Some(entry) = front {
-                if entry.frame.num <= frame_num {
-                    let index = (frame_num - entry.frame.num) as usize;
-                    return Some(d.frames[index].frame.clone());
+            let mut notified = pin!(self.wait_for_frame.notified());
+            {
+                let d = self.data.lock().unwrap();
+                if frame_num < d.frame_number {
+                    let oldest = d.frames.front().map_or(d.frame_number, |e| e.frame.num);
+                    assert!(
+                        frame_num >= oldest,
+                        "Frame fell out of buffer! asked for {}, earliest frame is {}",
+                        frame_num,
+                        oldest
+                    );
+                    return Some(d.frames[(frame_num - oldest) as usize].frame.clone());
                 }
+                if d.finished {
+                    return None;
+                }
+                // Register as a waiter while still holding the lock so a frame added
+                // between dropping the lock and awaiting can't be missed.
+                notified.as_mut().enable();
             }
-            let f = timeout(Duration::from_millis(500), self.wait_for_frame.notified());
-            drop(d);
-            f.await.ok();
+            notified.await;
         }
     }
 
@@ -97,36 +109,39 @@ impl<'a> FrameBuffer {
         &self,
         reader: &mut (impl AsyncBufReadExt + Unpin),
     ) -> io::Result<Status> {
-        let mut frame = Frame::new(self.frame_size, 0);
+        // Acquire a permit before taking the lock; this will block if the buffer is full.
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+        let mut frame = self.pool.take(self.frame_size, 0);
         let status = frame.read(frame.num, reader).await?;
+        let mut w = self.data.lock().unwrap();
         if status == Status::Processing {
-            let mut w = self.data.write().await;
-            // Acquire a permit for the new frame; this will block if the buffer is full.
-            let permit = self.semaphore.clone().acquire_owned().await.unwrap();
             frame.num = w.frame_number;
-            let entry = BufferEntry {
+            w.frames.push_back(BufferEntry {
                 frame: Arc::new(frame),
                 _permit: permit,
-            };
-            w.frames.push_back(entry);
+            });
             w.frame_number += 1;
+        } else {
+            w.finished = true;
         }
+        drop(w);
         self.wait_for_frame.notify_waiters();
         Ok(status)
     }
 
+    /// Removes the oldest frame from the buffer.
     pub async fn pop(&self) -> Option<Arc<Frame>> {
         // Removing the entry drops its OwnedSemaphorePermit, releasing a slot.
         self.data
-            .write()
-            .await
+            .lock()
+            .unwrap()
             .frames
-            .pop_back()
+            .pop_front()
             .map(|entry| entry.frame)
     }
 
     pub async fn size(&self) -> usize {
-        self.data.read().await.frames.len()
+        self.data.lock().unwrap().frames.len()
     }
 }
 
@@ -257,5 +272,70 @@ mod tests {
         let frame1 = buffer.get_frame(1).await.unwrap();
         assert_eq!(frame0.data(), b"what");
         assert_eq!(frame1.data(), b"love");
+    }
+
+    fn tiny_header() -> VideoHeader {
+        VideoHeader {
+            width: 2,
+            height: 1,
+            rate: "123".to_string(),
+            interlace: None,
+            aspect_ratio: None,
+            color_space_type: Some(ColorSpaceType::C440),
+            as_bytes: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn get_frame_past_end_returns_none() {
+        let buffer = FrameBuffer::new(2, tiny_header());
+        let mut test_file = Cursor::new(b"FRAME\x0Awhat".to_vec());
+        assert_eq!(
+            buffer.read_in_frame(&mut test_file).await.unwrap(),
+            Status::Processing
+        );
+        assert_eq!(
+            buffer.read_in_frame(&mut test_file).await.unwrap(),
+            Status::Completed
+        );
+        assert_eq!(buffer.get_frame(0).await.unwrap().data(), b"what");
+        assert!(buffer.get_frame(1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_frame_waits_for_future_frame() {
+        let buffer = Arc::new(FrameBuffer::new(2, tiny_header()));
+        let mut test_file = Cursor::new(b"FRAME\x0AwhatFRAME\x0Alove".to_vec());
+        buffer.read_in_frame(&mut test_file).await.unwrap();
+
+        let reader = buffer.clone();
+        let frame = tokio::spawn(async move { reader.get_frame(1).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        buffer.read_in_frame(&mut test_file).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_millis(100), frame)
+            .await
+            .expect("waiter should be woken without polling")
+            .unwrap();
+        assert_eq!(frame.data(), b"love");
+    }
+
+    #[tokio::test]
+    async fn full_buffer_unblocks_on_pop() {
+        let buffer = Arc::new(FrameBuffer::new(1, tiny_header()));
+        let writer = buffer.clone();
+        let read = tokio::spawn(async move {
+            let mut test_file = Cursor::new(b"FRAME\x0AwhatFRAME\x0Alove".to_vec());
+            writer.read_in_frame(&mut test_file).await.unwrap();
+            writer.read_in_frame(&mut test_file).await.unwrap();
+        });
+
+        assert_eq!(buffer.get_frame(0).await.unwrap().data(), b"what");
+        assert_eq!(buffer.pop().await.unwrap().num, 0);
+        tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("reader deadlocked on a full buffer")
+            .unwrap();
+        assert_eq!(buffer.get_frame(1).await.unwrap().data(), b"love");
     }
 }

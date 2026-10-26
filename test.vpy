@@ -1,13 +1,11 @@
 from vapoursynth import core
 import vapoursynth as vs
 
-#print(core.std.LoadPlugin('libknlmeanscl.so'))
-core.std.LoadPlugin('/usr/local/lib/vapoursynth/libmiscfilters.so')
-
+# Smoke test for test.mkv: 5s, 320x160, 24fps (120 frames), 8-bit 4:2:0 H.264.
 clip = core.lsmas.LWLibavSource(file)
 
-clip = clip.std.Trim(first=1000, last=1500)
+# sav1n encodes at 10-bit, and libvmaf needs the reference y4m in the same
+# pixel format as the decoded 10-bit encode.
+clip = core.resize.Point(clip, format=vs.YUV420P10)
 
-print(dir(clip))
-#clip = clip.knlm.KNLMeansCL(d=1, a=1, s=1, h=1)
 clip.set_output()

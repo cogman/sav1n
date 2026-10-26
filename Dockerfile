@@ -336,6 +336,19 @@ RUN git -C libvpx pull 2> /dev/null || git clone --depth 1 https://chromium.goog
     make && \
     make install
 
+FROM build AS x265
+RUN git clone --depth=1 -b 4.2 https://bitbucket.org/multicoreware/x265_git.git /x265
+WORKDIR /x265/build/linux
+RUN cmake -G "Unix Makefiles" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DENABLE_SHARED=OFF \
+    -DENABLE_CLI=ON \
+    -DHIGH_BIT_DEPTH=ON \
+    /x265/source && \
+    make && \
+    make install
+
 
 FROM build AS ffmpeg
 
@@ -414,6 +427,7 @@ COPY --from=vapoursynth /usr/local/lib/python3.13/site-packages /usr/local/lib/p
 
 COPY --from=vapoursynth /usr/local/bin/vspipe /usr/local/bin/
 COPY --from=vpx /usr/local/bin/vpxenc /usr/local/bin/
+COPY --from=x265 /usr/local/bin/x265 /usr/local/bin/
 COPY --from=vmaf /vmaf/vmaf-3.0.0/model/vmaf_v0.6.1.json /usr/local/share/model/
 COPY --from=aom /usr/local/bin/aomenc /usr/local/bin/
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/

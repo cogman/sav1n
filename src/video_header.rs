@@ -55,7 +55,7 @@ impl VideoHeader {
         }
     }
 
-    pub async fn write(self, writer: &mut (impl AsyncWriteExt + Unpin)) -> io::Result<()> {
+    pub async fn write(&self, writer: &mut (impl AsyncWriteExt + Unpin)) -> io::Result<()> {
         return writer.write_all(self.as_bytes.as_slice()).await;
     }
 

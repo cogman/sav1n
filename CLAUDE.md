@@ -21,16 +21,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
   1. **Audio extraction** – `ffprobe` to discover streams, then `ffmpeg` to encode audio to Opus.
   2. **Video preprocessing** – `vspipe` runs a VapourSynth script, producing Y4M frames and optional timecodes.
   3. **Scene detection** – First‑pass AOM (AV1) encoding writes keyframe statistics; these are consumed by a stats processor to decide scene boundaries.
-  4. **Scene encoding** – Each scene is encoded twice (first‑pass for quality estimation, second‑pass for final output) using either the VP9 (`Vp9Encoder`) or AV1 (`Av1Encoder`) implementation behind the `Encoder` trait.
+  4. **Scene encoding** – Each scene is encoded using the VP9 (`Vp9Encoder`), AV1 (`Av1Encoder`), or x265 (`X265Encoder`) implementation behind the `Encoder` trait. VP9 and AV1 use a two‑pass flow (first‑pass for quality estimation, second‑pass for final output); x265 uses single‑pass CRF.
   5. **VMAF quality search** – A secant search adjusts the constant quality (CQ) value per scene to meet the target VMAF score.
   6. **Muxing** – `mkvmerge` concatenates the per‑scene IVF files, audio track, and optional timestamps into the final MKV.
 - **Key modules**:
-  - `src/encoder.rs` – Defines the `Encoder` trait and concrete implementations for VP9 and AV1.
+  - `src/encoder.rs` – Defines the `Encoder` trait and concrete implementations for VP9, AV1, and x265.
   - `src/frame.rs`, `src/frame_buffer.rs` – Frame handling and buffering logic.
   - `src/video_header.rs` – Reads/writes Y4M headers.
   - `src/aom_firstpass.rs` – Parses AOM first‑pass logs for scene detection.
-  - `src/vp9_encoder.rs` / `src/av1_encoder.rs` – Wrapper around external encoders (`vpxenc`, `aomenc`).
-- **External dependencies**: The tool orchestrates several command‑line utilities (`ffprobe`, `ffmpeg`, `mkvmerge`, `aomenc`, `vpxenc`, `vspipe`). These must be installed and available in `$PATH`.
+  - `src/vp9_encoder.rs` / `src/av1_encoder.rs` / `src/x265_encoder.rs` – Wrapper around external encoders (`vpxenc`, `aomenc`, `x265`).
+- **External dependencies**: The tool orchestrates several command‑line utilities (`ffprobe`, `ffmpeg`, `mkvmerge`, `aomenc`, `vpxenc`, `x265`, `vspipe`). These must be installed and available in `$PATH`.
 - **Configuration**: CLI flags control input files, VapourSynth script, number of parallel encoders, target VMAF, CPU usage for encoding, and codec selection.
 
 ## Notes for Claude Code

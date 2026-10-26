@@ -5,8 +5,10 @@ mod frame;
 mod frame_buffer;
 mod video_header;
 mod vp9_encoder;
+mod x265_encoder;
 
 use crate::aom_firstpass::aom::AomFirstpass;
+use crate::frame::Frame;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
 use crate::video_header::VideoHeader;
@@ -18,9 +20,11 @@ use serde_json::Value;
 use crate::av1_encoder::Av1Encoder;
 use crate::encoder::{Encoder, EncoderOptions};
 use crate::vp9_encoder::Vp9Encoder;
+use crate::x265_encoder::X265Encoder;
 use glob::glob;
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::io::Write;
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -30,8 +34,7 @@ use tokio::fs::{create_dir, remove_dir_all, remove_file};
 use tokio::io::{AsyncWriteExt, BufReader, ErrorKind};
 use tokio::join;
 use tokio::process::{Child, Command};
-use tokio::sync::broadcast::{Receiver, Sender};
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
 
@@ -62,6 +65,7 @@ async fn main() {
     let encoder: Arc<dyn Encoder + Send + Sync> = match encoder_str.as_str() {
         "vpx" => Arc::new(Vp9Encoder {}),
         "av1" => Arc::new(Av1Encoder {}),
+        "x265" => Arc::new(X265Encoder {}),
         _ => panic!("Shouldn't have gotten here"),
     };
     let active_encodes = Arc::new(Semaphore::new(encoders));
@@ -127,11 +131,12 @@ async fn compress_file(
     let buffer = Arc::new(FrameBuffer::new(129, header.clone()));
 
     let delayed_aom = analyzed_aom_frames.clone();
-    let (stats_tx, stats_rx) = broadcast::channel(129);
+    let (stats_tx, stats_rx) = mpsc::channel(129);
 
     let frame_stats_processor =
         stats_processor(header.clone(), delayed_aom, stats_tx, tmp_folder.clone());
 
+    let container_format = encoder.container_format();
     let processing = process(
         stats_rx,
         buffer.clone(),
@@ -163,12 +168,12 @@ async fn compress_file(
     frame_stats_processor.await.unwrap();
     audio_processing.await.unwrap();
 
-    concat(input_path, tmp_folder.clone(), scenes).await;
+    concat(input_path, tmp_folder.clone(), scenes, container_format).await;
     println!("Cleaning up temp folder");
     remove_dir_all(tmp_folder).await.unwrap();
 }
 
-async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
+async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_format: &str) {
     let output_name = String::from(
         input_path
             .with_extension("new.mkv")
@@ -186,7 +191,7 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32) {
 
     options.push("[".to_string());
     for scene in 0..=scenes {
-        let concat_line = format!("{}/{:06}.ivf", tmp_folder, scene);
+        let concat_line = format!("{}/{:06}.{}", tmp_folder, scene, container_format);
         options.push(concat_line);
     }
     options.push("]".to_string());
@@ -283,7 +288,7 @@ fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinH
 }
 
 fn process(
-    mut stats_rx: Receiver<FrameStats>,
+    mut stats_rx: mpsc::Receiver<FrameStats>,
     scene_buffer: Arc<FrameBuffer>,
     header: VideoHeader,
     active_encodes_vpx: Arc<Semaphore>,
@@ -294,17 +299,13 @@ fn process(
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> JoinHandle<u32> {
     task::spawn(async move {
+        let header = Arc::new(header);
         let mut scene: u32 = 0;
-        let mut file = File::create(format!("{}/{:06}.y4m", tmp_folder, scene))
-            .await
-            .unwrap();
+        let mut file = create_scene_file(&tmp_folder, scene, header.clone()).await;
         let prior_cq_values: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-        header.clone().write(&mut file).await.unwrap();
         let mut inflight_scenes = vec![];
-        while let Ok(stat) = stats_rx.recv().await {
+        while let Some(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
-                file.flush().await.unwrap();
-                file.shutdown().await.unwrap();
                 drop(file);
                 inflight_scenes.push(
                     compress_scene(
@@ -320,19 +321,13 @@ fn process(
                     .await,
                 );
                 scene += 1;
-                file = File::create(format!("{}/{:06}.y4m", tmp_folder, scene))
-                    .await
-                    .unwrap();
-                header.clone().write(&mut file).await.unwrap();
+                file = create_scene_file(&tmp_folder, scene, header.clone()).await;
             }
             let frame = scene_buffer.get_frame(stat.frame_num).await;
             if let Some(frame_data) = frame {
                 assert_eq!(stat.frame_num, frame_data.num);
-                frame_data.write(&mut file).await.unwrap();
+                file = write_scene_frame(file, frame_data).await;
                 scene_buffer.pop().await;
-                unsafe {
-                    libmimalloc_sys::mi_collect(true);
-                }
             } else {
                 break;
             }
@@ -358,6 +353,33 @@ fn process(
     })
 }
 
+async fn create_scene_file(
+    tmp_folder: &str,
+    scene: u32,
+    header: Arc<VideoHeader>,
+) -> std::fs::File {
+    let path = format!("{}/{:06}.y4m", tmp_folder, scene);
+    task::spawn_blocking(move || {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&header.as_bytes).unwrap();
+        file
+    })
+    .await
+    .unwrap()
+}
+
+/// Writes the frame straight from the shared buffer on the blocking pool.
+/// tokio::fs::File would copy every frame into its own buffer in 2MB chunks, one pool round trip each.
+async fn write_scene_frame(mut file: std::fs::File, frame: Arc<Frame>) -> std::fs::File {
+    task::spawn_blocking(move || {
+        file.write_all(b"FRAME\x0A").unwrap();
+        file.write_all(frame.data()).unwrap();
+        file
+    })
+    .await
+    .unwrap()
+}
+
 async fn compress_scene(
     scene_number: u32,
     encoding_scenes: Arc<Semaphore>,
@@ -370,8 +392,11 @@ async fn compress_scene(
 ) -> JoinHandle<()> {
     encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
-        let mut first_pass = first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await;
-        first_pass.wait().await.unwrap();
+        if let Some(mut first_pass) =
+            first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await
+        {
+            first_pass.wait().await.unwrap();
+        }
         let mut initial_min = 20;
         let mut initial_max = 40;
         {
@@ -387,7 +412,7 @@ async fn compress_scene(
         }
         let cq = vmaf_secant_search(
             10,
-            60,
+            encoder.max_cq(),
             initial_min,
             initial_max,
             vmaf_cpu_used,
@@ -423,7 +448,7 @@ async fn first_pass(
     scene_number: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
-) -> Child {
+) -> Option<Child> {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
     encoder
         .first_pass(EncoderOptions {
@@ -432,8 +457,7 @@ async fn first_pass(
             output: "/dev/null",
             ..Default::default()
         })
-        .spawn()
-        .unwrap()
+        .map(|mut c| c.spawn().unwrap())
 }
 
 async fn second_pass(
@@ -450,7 +474,7 @@ async fn second_pass(
             cpu_used: cpu_used,
             log_file: format!("{}.log", scene_str).as_str(),
             input: format!("{}.y4m", scene_str).as_str(),
-            output: format!("{}.ivf", scene_str).as_str(),
+            output: format!("{}.{}", scene_str, encoder.container_format()).as_str(),
             ..Default::default()
         })
         .spawn()
@@ -463,7 +487,11 @@ async fn cleanup(scene_number: u32, tmp_folder: String) {
     let remove_scene = remove_file(format!("{}.log", scene_str));
     let (video, scene) = join!(remove_video, remove_scene);
     video.unwrap();
-    scene.unwrap();
+    if let Err(e) = scene {
+        if e.kind() != ErrorKind::NotFound {
+            panic!("Failed to remove {}.log: {}", scene_str, e);
+        }
+    }
 }
 
 async fn vmaf_second_pass(
@@ -501,6 +529,8 @@ async fn vmaf_second_pass(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .arg("-y")
+        .arg("-f")
+        .arg(encoder.container_format())
         .arg("-i")
         .arg("pipe:0")
         .arg("-i")
@@ -523,7 +553,7 @@ async fn vmaf_second_pass(
     let results = String::from_utf8(ffmpeg_output.unwrap().stderr).unwrap();
     let captures: Captures = VMAF_RE
         .captures(results.as_str())
-        .expect(format!("Failed to decode: {}", results).as_str());
+        .unwrap_or_else(|| panic!("Failed to decode: {}", results));
     let capture: &str = &captures[1];
 
     capture.parse().map(|n: f64| n / 100.0).unwrap()
@@ -624,7 +654,7 @@ async fn vmaf_secant_search(
 fn stats_processor(
     video_header: VideoHeader,
     delayed_aom: Arc<Semaphore>,
-    stats_tx: Sender<FrameStats>,
+    stats_tx: mpsc::Sender<FrameStats>,
     tmp_folder: String,
 ) -> JoinHandle<()> {
     task::spawn(async move {
@@ -655,16 +685,20 @@ fn stats_processor(
             if since_last_keyframe >= 1000
                 || current.test_candidate_kf(&last, &frame_stats, since_last_keyframe, num_mbs)
             {
-                stats_tx.send(FrameStats {
-                    frame_num: current.frame as u64,
-                    is_keyframe: true,
-                });
+                let _ = stats_tx
+                    .send(FrameStats {
+                        frame_num: current.frame as u64,
+                        is_keyframe: true,
+                    })
+                    .await;
                 since_last_keyframe = 0;
             } else {
-                stats_tx.send(FrameStats {
-                    frame_num: current.frame as u64,
-                    is_keyframe: false,
-                });
+                let _ = stats_tx
+                    .send(FrameStats {
+                        frame_num: current.frame as u64,
+                        is_keyframe: false,
+                    })
+                    .await;
             }
             since_last_keyframe += 1;
             last = current;
@@ -674,15 +708,19 @@ fn stats_processor(
                 Ok(stat) => frame_stats.push_back(stat),
                 Err(e) => {
                     if e.kind() == ErrorKind::UnexpectedEof {
-                        stats_tx.send(FrameStats {
-                            frame_num: current.frame as u64,
-                            is_keyframe: false,
-                        });
-                        for stats in frame_stats {
-                            stats_tx.send(FrameStats {
-                                frame_num: stats.frame as u64,
+                        let _ = stats_tx
+                            .send(FrameStats {
+                                frame_num: current.frame as u64,
                                 is_keyframe: false,
-                            });
+                            })
+                            .await;
+                        for stats in frame_stats {
+                            let _ = stats_tx
+                                .send(FrameStats {
+                                    frame_num: stats.frame as u64,
+                                    is_keyframe: false,
+                                })
+                                .await;
                         }
                         drop(stats_tx);
                         break;
@@ -704,7 +742,7 @@ fn aom_firstpass_for_scene_detection(
     let mut aom = start_aom_scene_detection(tmp_folder.clone());
     let mut aom_input = aom.stdin.take().unwrap();
     task::spawn(async move {
-        video_header.clone().write(&mut aom_input).await.unwrap();
+        video_header.write(&mut aom_input).await.unwrap();
         let mut frame_num = 0;
         loop {
             let frame = writing_buf.get_frame(frame_num).await;
@@ -822,7 +860,7 @@ fn extract_options() -> ArgMatches {
                 .short('o')
                 .long("codec")
                 .default_value("vpx")
-                .possible_values(["vpx", "av1"])
+                .possible_values(["vpx", "av1", "x265"])
                 .multiple_values(false)
                 .takes_value(true),
         )

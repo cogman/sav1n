@@ -8,7 +8,7 @@ unsafe impl Send for Vp9Encoder {}
 unsafe impl Sync for Vp9Encoder {}
 
 impl Encoder for Vp9Encoder {
-    fn first_pass(&self, options: EncoderOptions) -> Command {
+    fn first_pass(&self, options: EncoderOptions) -> Option<Command> {
         let mut c = Command::new("vpxenc");
         c.arg("--quiet")
             .arg("--passes=2")
@@ -22,7 +22,7 @@ impl Encoder for Vp9Encoder {
             .arg("-o")
             .arg("/dev/null")
             .arg(options.input);
-        return c;
+        return Some(c);
     }
 
     fn second_pass(&self, options: EncoderOptions) -> Command {
@@ -50,5 +50,13 @@ impl Encoder for Vp9Encoder {
             .arg(options.output)
             .arg(options.input);
         return c;
+    }
+
+    fn container_format(&self) -> &'static str {
+        "ivf"
+    }
+
+    fn max_cq(&self) -> u32 {
+        60
     }
 }

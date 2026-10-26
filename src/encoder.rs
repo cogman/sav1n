@@ -1,8 +1,10 @@
 use tokio::process::Command;
 
 pub trait Encoder {
-    fn first_pass(&self, options: EncoderOptions) -> Command;
+    fn first_pass(&self, options: EncoderOptions) -> Option<Command>;
     fn second_pass(&self, options: EncoderOptions) -> Command;
+    fn container_format(&self) -> &'static str;
+    fn max_cq(&self) -> u32;
 }
 
 pub struct EncoderOptions<'t> {
