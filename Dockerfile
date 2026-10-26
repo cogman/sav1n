@@ -285,7 +285,7 @@ COPY --from=znedi3 /znedi3/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/lib/vapoursynth
 
 FROM build AS aom
-RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b master /aom
+RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b main /aom
 WORKDIR /aom_build
 RUN cmake -DBUILD_SHARED_LIBS=1 -DCMAKE_BUILD_TYPE=Release /aom && \
     make && \
