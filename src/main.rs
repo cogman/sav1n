@@ -197,6 +197,34 @@ async fn compress_file(
     shutdown::untrack_temp_dir(Path::new(&tmp_folder));
 }
 
+fn mkvmerge_options(
+    output_name: &str,
+    tmp_folder: &str,
+    scenes: u32,
+    container_format: &str,
+    has_timecodes: bool,
+) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    options.push("-o".to_string());
+    options.push(output_name.to_string());
+
+    options.push(format!("{}/audio.mkv", tmp_folder));
+
+    if has_timecodes {
+        options.push("--timestamps".to_string());
+        options.push(format!("0:{}/timecodes.txt", tmp_folder));
+    }
+
+    options.push("[".to_string());
+    for scene in 0..=scenes {
+        let concat_line = format!("{}/{:06}.{}", tmp_folder, scene, container_format);
+        options.push(concat_line);
+    }
+    options.push("]".to_string());
+
+    options
+}
+
 async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_format: &str) {
     let output_name = String::from(
         input_path
@@ -207,23 +235,14 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_
             .unwrap(),
     );
 
-    let mut options: Vec<String> = Vec::new();
-    options.push("-o".to_string());
-    options.push(output_name.clone());
-
-    options.push(format!("{}/audio.mkv", tmp_folder));
-
-    options.push("[".to_string());
-    for scene in 0..=scenes {
-        let concat_line = format!("{}/{:06}.{}", tmp_folder, scene, container_format);
-        options.push(concat_line);
-    }
-    options.push("]".to_string());
-
-    if Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists() {
-        options.push("--timestamps".to_string());
-        options.push(format!("0:{}/timecodes.txt", tmp_folder));
-    }
+    let has_timecodes = Path::new(format!("{}/timecodes.txt", tmp_folder).as_str()).exists();
+    let options = mkvmerge_options(
+        &output_name,
+        &tmp_folder,
+        scenes,
+        container_format,
+        has_timecodes,
+    );
 
     serde_json::to_writer(
         &std::fs::File::create(format!("{}/options.json", tmp_folder).as_str())
@@ -235,7 +254,20 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_
     println!("Writing {}", output_name);
     let mut mkvmerge = Command::new("mkvmerge");
     mkvmerge.arg(format!("@{}/options.json", tmp_folder).as_str());
-    TrackedChild::spawn(mkvmerge).unwrap().wait().await.unwrap();
+    let status = TrackedChild::spawn(mkvmerge)
+        .expect("failed to start mkvmerge")
+        .wait()
+        .await
+        .expect("failed to wait for mkvmerge");
+
+    match status.code() {
+        Some(0) => {}
+        Some(1) => eprintln!("mkvmerge completed with warnings while writing {output_name}"),
+        _ => {
+            let _ = std::fs::remove_file(&output_name);
+            panic!("mkvmerge failed with {status} while writing {output_name}");
+        }
+    }
 }
 
 fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinHandle<()> {
@@ -983,6 +1015,44 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn builds_mkvmerge_concat_options() {
+        let options = mkvmerge_options("video.new.mkv", "/tmp/0", 1, "ivf", false);
+
+        assert_eq!(
+            options,
+            [
+                "-o",
+                "video.new.mkv",
+                "/tmp/0/audio.mkv",
+                "[",
+                "/tmp/0/000000.ivf",
+                "/tmp/0/000001.ivf",
+                "]"
+            ]
+        );
+    }
+
+    #[test]
+    fn places_timestamps_before_the_x265_hevc_file_list() {
+        let options = mkvmerge_options("video.new.mkv", "/tmp/0", 1, "hevc", true);
+
+        assert_eq!(
+            options,
+            [
+                "-o",
+                "video.new.mkv",
+                "/tmp/0/audio.mkv",
+                "--timestamps",
+                "0:/tmp/0/timecodes.txt",
+                "[",
+                "/tmp/0/000000.hevc",
+                "/tmp/0/000001.hevc",
+                "]"
+            ]
+        );
     }
 
     #[test]
