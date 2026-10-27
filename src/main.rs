@@ -3,6 +3,7 @@ mod av1_encoder;
 mod encoder;
 mod frame;
 mod frame_buffer;
+mod shutdown;
 mod video_header;
 mod vp9_encoder;
 mod x265_encoder;
@@ -11,6 +12,7 @@ use crate::aom_firstpass::aom::AomFirstpass;
 use crate::frame::Frame;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
+use crate::shutdown::TrackedChild;
 use crate::video_header::VideoHeader;
 use clap::{value_parser, Arg, ArgMatches, Command as ClapCommand};
 use regex::{Captures, Regex};
@@ -33,7 +35,7 @@ use tokio::fs::File;
 use tokio::fs::{create_dir, remove_dir_all, remove_file};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader, ErrorKind};
 use tokio::join;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
@@ -45,6 +47,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() {
+    shutdown::install();
     let options = extract_options();
 
     let targets: Vec<PathBuf> = options
@@ -99,7 +102,16 @@ async fn main() {
     }
 
     for task in tasks {
-        task.await.unwrap();
+        match task.await {
+            Ok(()) => {}
+            Err(_) if shutdown::is_shutting_down() => {
+                std::future::pending::<()>().await;
+            }
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        }
+    }
+    if shutdown::is_shutting_down() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -118,6 +130,10 @@ async fn compress_file(
     println!("Encoding {}", i);
     let tmp_folder = format!("/tmp/{}", processed_file);
     create_dir(&tmp_folder).await.unwrap();
+    if !shutdown::track_temp_dir(PathBuf::from(&tmp_folder)) {
+        let _ = remove_dir_all(&tmp_folder).await;
+        return;
+    }
 
     let audio_processing = encode_audio(i.clone(), active_encoders.clone(), tmp_folder.clone());
 
@@ -168,7 +184,7 @@ async fn compress_file(
         status = buffer.read_in_frame(&mut vs_pipe_reader).await.unwrap();
     }
     drop(vs_pipe_reader);
-    drop(vspipe);
+    vspipe.wait().await.unwrap();
     can_do_next.add_permits(1);
     let scenes = processing.await.unwrap();
     aom_first_pass_scene.await.unwrap();
@@ -177,7 +193,8 @@ async fn compress_file(
 
     concat(input_path, tmp_folder.clone(), scenes, container_format).await;
     println!("Cleaning up temp folder");
-    remove_dir_all(tmp_folder).await.unwrap();
+    remove_dir_all(&tmp_folder).await.unwrap();
+    shutdown::untrack_temp_dir(Path::new(&tmp_folder));
 }
 
 async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_format: &str) {
@@ -216,27 +233,24 @@ async fn concat(input_path: PathBuf, tmp_folder: String, scenes: u32, container_
     .expect("Failed to serialize options file");
 
     println!("Writing {}", output_name);
-    Command::new("mkvmerge")
-        .arg(format!("@{}/options.json", tmp_folder).as_str())
-        .spawn()
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
+    let mut mkvmerge = Command::new("mkvmerge");
+    mkvmerge.arg(format!("@{}/options.json", tmp_folder).as_str());
+    TrackedChild::spawn(mkvmerge).unwrap().wait().await.unwrap();
 }
 
 fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinHandle<()> {
     task::spawn(async move {
         permits.acquire().await.unwrap().forget();
-        let probe_results = Command::new("ffprobe")
+        let mut ffprobe = Command::new("ffprobe");
+        ffprobe
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .arg("-hide_banner")
             .arg("-print_format")
             .arg("json")
             .arg("-show_streams")
-            .arg(&i)
-            .spawn()
+            .arg(&i);
+        let probe_results = TrackedChild::spawn(ffprobe)
             .unwrap()
             .wait_with_output()
             .await
@@ -247,7 +261,7 @@ fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinH
 
         let mut audio_encode = Command::new("ffmpeg");
         let subtitles = if i.ends_with("mp4") { "srt" } else { "copy" };
-        let mut next_section = audio_encode
+        audio_encode
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .arg("-y")
@@ -275,20 +289,19 @@ fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinH
                 ));
                 let channels = stream["channels"].as_u64().unwrap();
                 let bitrate = channels * 42;
-                next_section = next_section
+                audio_encode
                     .arg(format!("-b:a:{}", audio_index))
                     .arg(format!("{}K", bitrate));
                 audio_index += 1;
             }
         }
-        let mut child = next_section
+        audio_encode
             .arg("-filter_complex")
             .arg(channel_map.join(";"))
             .arg("-c:s")
             .arg(subtitles)
-            .arg(format!("{}/audio.mkv", tmp_folder))
-            .spawn()
-            .unwrap();
+            .arg(format!("{}/audio.mkv", tmp_folder));
+        let mut child = TrackedChild::spawn(audio_encode).unwrap();
         child.wait().await.unwrap();
         permits.add_permits(1);
     })
@@ -455,7 +468,7 @@ async fn first_pass(
     scene_number: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
-) -> Option<Child> {
+) -> Option<TrackedChild> {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
     encoder
         .first_pass(EncoderOptions {
@@ -464,7 +477,7 @@ async fn first_pass(
             output: "/dev/null",
             ..Default::default()
         })
-        .map(|mut c| c.spawn().unwrap())
+        .map(|c| TrackedChild::spawn(c).unwrap())
 }
 
 async fn second_pass(
@@ -473,19 +486,17 @@ async fn second_pass(
     cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
-) -> Child {
+) -> TrackedChild {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    encoder
-        .second_pass(EncoderOptions {
-            cq: cq,
-            cpu_used: cpu_used,
-            log_file: format!("{}.log", scene_str).as_str(),
-            input: format!("{}.y4m", scene_str).as_str(),
-            output: format!("{}.{}", scene_str, encoder.container_format()).as_str(),
-            ..Default::default()
-        })
-        .spawn()
-        .unwrap()
+    let command = encoder.second_pass(EncoderOptions {
+        cq,
+        cpu_used,
+        log_file: format!("{}.log", scene_str).as_str(),
+        input: format!("{}.y4m", scene_str).as_str(),
+        output: format!("{}.{}", scene_str, encoder.container_format()).as_str(),
+        ..Default::default()
+    });
+    TrackedChild::spawn(command).unwrap()
 }
 
 async fn cleanup(scene_number: u32, tmp_folder: String) {
@@ -510,19 +521,17 @@ async fn vmaf_second_pass(
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> f64 {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    let mut encode = encoder
-        .second_pass(EncoderOptions {
-            cq,
-            cpu_used,
-            threads,
-            log_file: format!("{}.log", scene_str).as_str(),
-            output: "-",
-            input: format!("{}.y4m", scene_str).as_str(),
-            ..Default::default()
-        })
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut command = encoder.second_pass(EncoderOptions {
+        cq,
+        cpu_used,
+        threads,
+        log_file: format!("{}.log", scene_str).as_str(),
+        output: "-",
+        input: format!("{}.y4m", scene_str).as_str(),
+        ..Default::default()
+    });
+    command.stdout(Stdio::piped());
+    let mut encode = TrackedChild::spawn(command).unwrap();
 
     let encode_stdin: Stdio = encode
         .stdout
@@ -531,7 +540,8 @@ async fn vmaf_second_pass(
         .try_into()
         .expect("failed to convert to Stdio");
 
-    let ffmpeg = Command::new("ffmpeg")
+    let mut ffmpeg_command = Command::new("ffmpeg");
+    ffmpeg_command
         .stdin(encode_stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -548,9 +558,8 @@ async fn vmaf_second_pass(
         .arg("libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .spawn()
-        .unwrap();
+        .arg("-");
+    let ffmpeg = TrackedChild::spawn(ffmpeg_command).unwrap();
 
     let (_, ffmpeg_output) = join!(encode.wait(), ffmpeg.wait_with_output());
 
@@ -782,8 +791,9 @@ fn aom_firstpass_for_scene_detection(
     })
 }
 
-fn start_aom_scene_detection(tmp_folder: String) -> Child {
-    Command::new("nice")
+fn start_aom_scene_detection(tmp_folder: String) -> TrackedChild {
+    let mut command = Command::new("nice");
+    command
         .arg("-20")
         .arg("aomenc")
         .arg("--passes=2")
@@ -795,13 +805,13 @@ fn start_aom_scene_detection(tmp_folder: String) -> Child {
         .arg("-o")
         .arg("/dev/null")
         .arg("-")
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap()
+        .stdin(Stdio::piped());
+    TrackedChild::spawn(command).unwrap()
 }
 
-fn start_vspipe(input: &str, vpy: &str, tmp_folder: String) -> Child {
-    Command::new("nice")
+fn start_vspipe(input: &str, vpy: &str, tmp_folder: String) -> TrackedChild {
+    let mut command = Command::new("nice");
+    command
         .arg("-20")
         .arg("vspipe")
         .arg("-c")
@@ -814,9 +824,8 @@ fn start_vspipe(input: &str, vpy: &str, tmp_folder: String) -> Child {
         .arg(format!("tmp_folder={}", tmp_folder))
         .arg(vpy)
         .arg("-")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap()
+        .stdout(Stdio::piped());
+    TrackedChild::spawn(command).unwrap()
 }
 
 fn cli() -> ClapCommand {

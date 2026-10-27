@@ -28,6 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
   - `src/encoder.rs` – Defines the `Encoder` trait and concrete implementations for VP9, AV1, and x265.
   - `src/frame.rs`, `src/frame_buffer.rs` – Frame handling and buffering logic.
   - `src/video_header.rs` – Reads/writes Y4M headers.
+  - `src/shutdown.rs` – Tracks child processes and temporary folders, and terminates them gracefully on `SIGINT`/`SIGTERM`.
   - `src/aom_firstpass.rs` – Parses AOM first‑pass logs for scene detection.
   - `src/vp9_encoder.rs` / `src/av1_encoder.rs` / `src/x265_encoder.rs` – Wrapper around external encoders (`vpxenc`, `aomenc`, `x265`).
 - **External dependencies**: The tool orchestrates several command‑line utilities (`ffprobe`, `ffmpeg`, `mkvmerge`, `aomenc`, `vpxenc`, `x265`, `vspipe`). These must be installed and available in `$PATH`.

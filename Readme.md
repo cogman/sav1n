@@ -18,3 +18,5 @@ The easiest way to start using sav1n is through docker:
 ```bash
 docker run -v `pwd`:/video -it --rm cogman/sav1n:latest -i test.vpy
 ```
+
+Sending `SIGINT` (Ctrl-C) or `SIGTERM` stops all child encoders, gives them a short grace period, and removes temporary folders before exiting.
