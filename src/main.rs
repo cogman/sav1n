@@ -210,17 +210,27 @@ fn mkvmerge_options(
 
     options.push(format!("{}/audio.mkv", tmp_folder));
 
+    if scenes > 0 {
+        let append_to: Vec<String> = (1..=scenes)
+            .map(|scene| format!("{}:0:{}:0", scene + 1, scene))
+            .collect();
+        options.push("--append-to".to_string());
+        options.push(append_to.join(","));
+    }
+
     if has_timecodes {
         options.push("--timestamps".to_string());
         options.push(format!("0:{}/timecodes.txt", tmp_folder));
     }
 
-    options.push("[".to_string());
     for scene in 0..=scenes {
-        let concat_line = format!("{}/{:06}.{}", tmp_folder, scene, container_format);
-        options.push(concat_line);
+        let video_file = format!("{}/{:06}.{}", tmp_folder, scene, container_format);
+        if scene == 0 {
+            options.push(video_file);
+        } else {
+            options.push(format!("+{}", video_file));
+        }
     }
-    options.push("]".to_string());
 
     options
 }
@@ -1027,10 +1037,44 @@ mod tests {
                 "-o",
                 "video.new.mkv",
                 "/tmp/0/audio.mkv",
-                "[",
+                "--append-to",
+                "2:0:1:0",
                 "/tmp/0/000000.ivf",
-                "/tmp/0/000001.ivf",
-                "]"
+                "+/tmp/0/000001.ivf"
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_every_scene_to_the_previous_video_file() {
+        let options = mkvmerge_options("video.new.mkv", "/tmp/0", 2, "ivf", false);
+
+        assert_eq!(
+            options,
+            [
+                "-o",
+                "video.new.mkv",
+                "/tmp/0/audio.mkv",
+                "--append-to",
+                "2:0:1:0,3:0:2:0",
+                "/tmp/0/000000.ivf",
+                "+/tmp/0/000001.ivf",
+                "+/tmp/0/000002.ivf"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_scene_muxes_without_an_append_mapping() {
+        let options = mkvmerge_options("video.new.mkv", "/tmp/0", 0, "ivf", false);
+
+        assert_eq!(
+            options,
+            [
+                "-o",
+                "video.new.mkv",
+                "/tmp/0/audio.mkv",
+                "/tmp/0/000000.ivf"
             ]
         );
     }
@@ -1045,12 +1089,12 @@ mod tests {
                 "-o",
                 "video.new.mkv",
                 "/tmp/0/audio.mkv",
+                "--append-to",
+                "2:0:1:0",
                 "--timestamps",
                 "0:/tmp/0/timecodes.txt",
-                "[",
                 "/tmp/0/000000.hevc",
-                "/tmp/0/000001.hevc",
-                "]"
+                "+/tmp/0/000001.hevc"
             ]
         );
     }
