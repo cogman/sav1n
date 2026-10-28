@@ -25,7 +25,7 @@ use crate::x265_encoder::X265Encoder;
 use glob::glob;
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::io::{SeekFrom, Write};
+use std::io::SeekFrom;
 use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -379,10 +379,11 @@ fn process(
         let mut inflight_scenes = vec![];
         while let Some(stat) = stats_rx.recv().await {
             if stat.is_keyframe {
-                drop(file);
+                let next_file = create_scene_file(&tmp_folder, scene + 1, header.clone()).await;
                 inflight_scenes.push(
                     compress_scene(
                         scene,
+                        std::mem::replace(&mut file, next_file).close(),
                         active_encodes_vpx.clone(),
                         prior_cq_values.clone(),
                         vmaf_target,
@@ -394,7 +395,6 @@ fn process(
                     .await,
                 );
                 scene += 1;
-                file = create_scene_file(&tmp_folder, scene, header.clone()).await;
             }
             let frame = scene_buffer.get_frame(stat.frame_num).await;
             if let Some(frame_data) = frame {
@@ -409,6 +409,7 @@ fn process(
         inflight_scenes.push(
             compress_scene(
                 scene,
+                file.close(),
                 active_encodes_vpx.clone(),
                 prior_cq_values.clone(),
                 vmaf_target,
@@ -426,35 +427,105 @@ fn process(
     })
 }
 
-async fn create_scene_file(
-    tmp_folder: &str,
-    scene: u32,
-    header: Arc<VideoHeader>,
-) -> std::fs::File {
-    let path = format!("{}/{:06}.y4m", tmp_folder, scene);
-    task::spawn_blocking(move || {
-        let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(&header.as_bytes).unwrap();
-        file
-    })
-    .await
-    .unwrap()
+struct SceneWriter {
+    child: TrackedChild,
+    input: tokio::process::ChildStdin,
 }
 
-/// Writes the frame straight from the shared buffer on the blocking pool.
-/// tokio::fs::File would copy every frame into its own buffer in 2MB chunks, one pool round trip each.
-async fn write_scene_frame(mut file: std::fs::File, frame: Arc<Frame>) -> std::fs::File {
-    task::spawn_blocking(move || {
-        file.write_all(b"FRAME\x0A").unwrap();
-        file.write_all(frame.data()).unwrap();
-        file
-    })
-    .await
-    .unwrap()
+impl SceneWriter {
+    fn close(self) -> SceneFile {
+        drop(self.input);
+        SceneFile(self.child)
+    }
+}
+
+struct SceneFile(TrackedChild);
+
+impl SceneFile {
+    async fn wait(mut self) {
+        let status = self.0.wait().await.unwrap();
+        assert!(status.success(), "ffmpeg failed while writing a scene");
+    }
+}
+
+const FFV1_DECODE_THREADS: &str = "4";
+
+fn ffv1_scene_command(path: &str) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("yuv4mpegpipe")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-c:v")
+        .arg("ffv1")
+        .arg("-f")
+        .arg("matroska")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    command
+}
+
+fn ffv1_decoder_command(path: &str) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-nostdin")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-threads")
+        .arg(FFV1_DECODE_THREADS)
+        .arg("-i")
+        .arg(path)
+        // FFmpeg's y4m muxer rejects 10-bit pixel formats without this.
+        .arg("-strict")
+        .arg("-1")
+        .arg("-f")
+        .arg("yuv4mpegpipe")
+        .arg("pipe:1")
+        .stdout(Stdio::piped());
+    command
+}
+
+fn start_ffv1_decoder(path: &str) -> TrackedChild {
+    TrackedChild::spawn(ffv1_decoder_command(path)).expect("failed to start ffmpeg decoder")
+}
+
+async fn create_scene_file(tmp_folder: &str, scene: u32, header: Arc<VideoHeader>) -> SceneWriter {
+    let path = format!("{}/{:06}.mkv", tmp_folder, scene);
+    let mut child = TrackedChild::spawn(ffv1_scene_command(&path)).unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(&header.as_bytes).await.unwrap();
+    SceneWriter { child, input }
+}
+
+async fn write_scene_frame(mut writer: SceneWriter, frame: Arc<Frame>) -> SceneWriter {
+    writer.input.write_all(b"FRAME\x0A").await.unwrap();
+    writer.input.write_all(frame.data()).await.unwrap();
+    writer
+}
+
+struct EncodingProcess {
+    encoder: TrackedChild,
+    decoder: TrackedChild,
+}
+
+impl EncodingProcess {
+    async fn wait(&mut self) {
+        let encoder = self.encoder.wait().await.unwrap();
+        let decoder = self.decoder.wait().await.unwrap();
+        assert!(encoder.success(), "encoder failed");
+        assert!(decoder.success(), "ffmpeg decoder failed");
+    }
 }
 
 async fn compress_scene(
     scene_number: u32,
+    scene_file: SceneFile,
     encoding_scenes: Arc<Semaphore>,
     prior_cq_values: Arc<Mutex<Vec<u32>>>,
     vmaf_target: f64,
@@ -465,10 +536,11 @@ async fn compress_scene(
 ) -> JoinHandle<()> {
     encoding_scenes.acquire_many(2).await.unwrap().forget();
     tokio::spawn(async move {
+        scene_file.wait().await;
         if let Some(mut first_pass) =
             first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await
         {
-            first_pass.wait().await.unwrap();
+            first_pass.wait().await;
         }
         let mut initial_min = 20;
         let mut initial_max = 40;
@@ -510,7 +582,7 @@ async fn compress_scene(
             encoder.clone(),
         )
         .await;
-        second.wait().await.unwrap();
+        second.wait().await;
         drop(second);
         encoding_scenes.add_permits(1);
         cleanup(scene_number, tmp_folder).await;
@@ -521,16 +593,22 @@ async fn first_pass(
     scene_number: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
-) -> Option<TrackedChild> {
+) -> Option<EncodingProcess> {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    encoder
-        .first_pass(EncoderOptions {
-            log_file: format!("{}.log", scene_str).as_str(),
-            input: format!("{}.y4m", scene_str).as_str(),
-            output: "/dev/null",
-            ..Default::default()
-        })
-        .map(|c| TrackedChild::spawn(c).unwrap())
+    let scene_path = format!("{}.mkv", scene_str);
+    let mut command = encoder.first_pass(EncoderOptions {
+        log_file: format!("{}.log", scene_str).as_str(),
+        input: "-",
+        output: "/dev/null",
+        ..Default::default()
+    })?;
+    let mut decoder = start_ffv1_decoder(&scene_path);
+    let decoder_stdout: Stdio = decoder.stdout.take().unwrap().try_into().unwrap();
+    command.stdin(decoder_stdout);
+    Some(EncodingProcess {
+        encoder: TrackedChild::spawn(command).unwrap(),
+        decoder,
+    })
 }
 
 async fn second_pass(
@@ -539,22 +617,29 @@ async fn second_pass(
     cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
-) -> TrackedChild {
+) -> EncodingProcess {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    let command = encoder.second_pass(EncoderOptions {
+    let scene_path = format!("{}.mkv", scene_str);
+    let mut command = encoder.second_pass(EncoderOptions {
         cq,
         cpu_used,
         log_file: format!("{}.log", scene_str).as_str(),
-        input: format!("{}.y4m", scene_str).as_str(),
+        input: "-",
         output: format!("{}.{}", scene_str, encoder.container_format()).as_str(),
         ..Default::default()
     });
-    TrackedChild::spawn(command).unwrap()
+    let mut decoder = start_ffv1_decoder(&scene_path);
+    let decoder_stdout: Stdio = decoder.stdout.take().unwrap().try_into().unwrap();
+    command.stdin(decoder_stdout);
+    EncodingProcess {
+        encoder: TrackedChild::spawn(command).unwrap(),
+        decoder,
+    }
 }
 
 async fn cleanup(scene_number: u32, tmp_folder: String) {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
-    let remove_video = remove_file(format!("{}.y4m", scene_str));
+    let remove_video = remove_file(format!("{}.mkv", scene_str));
     let remove_scene = remove_file(format!("{}.log", scene_str));
     let (video, scene) = join!(remove_video, remove_scene);
     video.unwrap();
@@ -574,15 +659,19 @@ async fn vmaf_second_pass(
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> f64 {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
+    let scene_path = format!("{}.mkv", scene_str);
     let mut command = encoder.second_pass(EncoderOptions {
         cq,
         cpu_used,
         threads,
         log_file: format!("{}.log", scene_str).as_str(),
         output: "-",
-        input: format!("{}.y4m", scene_str).as_str(),
+        input: "-",
         ..Default::default()
     });
+    let mut decoder = start_ffv1_decoder(&scene_path);
+    let decoder_stdout: Stdio = decoder.stdout.take().unwrap().try_into().unwrap();
+    command.stdin(decoder_stdout);
     command.stdout(Stdio::piped());
     let mut encode = TrackedChild::spawn(command).unwrap();
 
@@ -603,8 +692,10 @@ async fn vmaf_second_pass(
         .arg(encoder.container_format())
         .arg("-i")
         .arg("pipe:0")
+        .arg("-threads")
+        .arg(FFV1_DECODE_THREADS)
         .arg("-i")
-        .arg(format!("{}.y4m", scene_str))
+        .arg(&scene_path)
         .arg("-threads")
         .arg("1")
         .arg("-lavfi")
@@ -614,7 +705,10 @@ async fn vmaf_second_pass(
         .arg("-");
     let ffmpeg = TrackedChild::spawn(ffmpeg_command).unwrap();
 
-    let (_, ffmpeg_output) = join!(encode.wait(), ffmpeg.wait_with_output());
+    let (encode_status, decoder_status, ffmpeg_output) =
+        join!(encode.wait(), decoder.wait(), ffmpeg.wait_with_output());
+    assert!(encode_status.unwrap().success(), "encoder failed");
+    assert!(decoder_status.unwrap().success(), "ffmpeg decoder failed");
 
     static VMAF_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap());
@@ -1145,6 +1239,63 @@ mod tests {
                 "0:/tmp/0/timecodes.txt",
                 "/tmp/0/000000.hevc",
                 "+/tmp/0/000001.hevc"
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_scenes_as_ffv1_matroska() {
+        let command = ffv1_scene_command("/tmp/0/000000.mkv");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-nostdin",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "yuv4mpegpipe",
+                "-i",
+                "pipe:0",
+                "-c:v",
+                "ffv1",
+                "-f",
+                "matroska",
+                "/tmp/0/000000.mkv",
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_scene_ffv1_to_y4m_for_encoders() {
+        let command = ffv1_decoder_command("/tmp/0/000000.mkv");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-threads",
+                "4",
+                "-i",
+                "/tmp/0/000000.mkv",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "pipe:1",
             ]
         );
     }

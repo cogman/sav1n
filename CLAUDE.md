@@ -21,7 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
   1. **Audio extraction** – `ffprobe` to discover streams, then `ffmpeg` to encode audio to Opus.
   2. **Video preprocessing** – `vspipe` runs a VapourSynth script, producing Y4M frames and optional timecodes.
   3. **Scene detection** – First‑pass AOM (AV1) encoding writes keyframe statistics; these are consumed by a stats processor to decide scene boundaries.
-  4. **Scene encoding** – Each scene is encoded using the VP9 (`Vp9Encoder`), AV1 (`Av1Encoder`), or x265 (`X265Encoder`) implementation behind the `Encoder` trait. VP9 and AV1 use a two‑pass flow (first‑pass for quality estimation, second‑pass for final output); x265 uses single‑pass CRF.
+  4. **Scene encoding** – Each scene is written to disk as a lossless FFV1 Matroska file, decoded back to Y4M on a pipe, and encoded using the VP9 (`Vp9Encoder`), AV1 (`Av1Encoder`), or x265 (`X265Encoder`) implementation behind the `Encoder` trait. VP9 and AV1 use a two‑pass flow (first‑pass for quality estimation, second‑pass for final output); x265 uses single‑pass CRF.
   5. **VMAF quality search** – A secant search adjusts the constant quality (CQ) value per scene to meet the target VMAF score.
   6. **Muxing** – `mkvmerge` concatenates the per‑scene IVF files, audio track, and optional timestamps into the final MKV.
 - **Key modules**:
