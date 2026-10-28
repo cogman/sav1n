@@ -650,6 +650,35 @@ async fn cleanup(scene_number: u32, tmp_folder: String) {
     }
 }
 
+fn vmaf_command(container_format: &str, scene_path: &str) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .arg("-y")
+        .arg("-f")
+        .arg(container_format)
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-threads")
+        .arg(FFV1_DECODE_THREADS)
+        .arg("-i")
+        .arg(scene_path)
+        .arg("-threads")
+        .arg("1")
+        .arg("-lavfi")
+        // Matroska rounds timestamps to milliseconds, so pair frames by index instead.
+        .arg(concat!(
+            "[0:v]settb=AVTB,setpts=N[distorted];",
+            "[1:v]settb=AVTB,setpts=N[reference];",
+            "[distorted][reference]libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'"
+        ))
+        .arg("-f")
+        .arg("null")
+        .arg("-");
+    command
+}
+
 async fn vmaf_second_pass(
     scene_number: u32,
     cq: u32,
@@ -682,27 +711,8 @@ async fn vmaf_second_pass(
         .try_into()
         .expect("failed to convert to Stdio");
 
-    let mut ffmpeg_command = Command::new("ffmpeg");
-    ffmpeg_command
-        .stdin(encode_stdin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .arg("-y")
-        .arg("-f")
-        .arg(encoder.container_format())
-        .arg("-i")
-        .arg("pipe:0")
-        .arg("-threads")
-        .arg(FFV1_DECODE_THREADS)
-        .arg("-i")
-        .arg(&scene_path)
-        .arg("-threads")
-        .arg("1")
-        .arg("-lavfi")
-        .arg("libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'")
-        .arg("-f")
-        .arg("null")
-        .arg("-");
+    let mut ffmpeg_command = vmaf_command(encoder.container_format(), &scene_path);
+    ffmpeg_command.stdin(encode_stdin);
     let ffmpeg = TrackedChild::spawn(ffmpeg_command).unwrap();
 
     let (encode_status, decoder_status, ffmpeg_output) =
@@ -1296,6 +1306,38 @@ mod tests {
                 "-f",
                 "yuv4mpegpipe",
                 "pipe:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn pairs_vmaf_frames_by_index() {
+        let command = vmaf_command("ivf", "/tmp/0/000000.mkv");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-y",
+                "-f",
+                "ivf",
+                "-i",
+                "pipe:0",
+                "-threads",
+                "4",
+                "-i",
+                "/tmp/0/000000.mkv",
+                "-threads",
+                "1",
+                "-lavfi",
+                "[0:v]settb=AVTB,setpts=N[distorted];[1:v]settb=AVTB,setpts=N[reference];[distorted][reference]libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'",
+                "-f",
+                "null",
+                "-",
             ]
         );
     }
