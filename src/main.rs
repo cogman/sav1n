@@ -301,52 +301,63 @@ fn encode_audio(i: String, permits: Arc<Semaphore>, tmp_folder: String) -> JoinH
         let probe_result: Value = serde_json::from_slice(&probe_results.stdout).unwrap();
         let streams = probe_result["streams"].as_array().unwrap();
 
-        let mut audio_encode = Command::new("ffmpeg");
-        let subtitles = if i.ends_with("mp4") { "srt" } else { "copy" };
-        audio_encode
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .arg("-y")
-            .arg("-i")
-            .arg(&i)
-            .arg("-map")
-            .arg("0")
-            .arg("-vn")
-            .arg("-c:a")
-            .arg("libopus")
-            .arg("-vbr")
-            .arg("on");
-        let mut channel_map = Vec::new();
-        let mut audio_index = 0;
-        for (i, stream) in streams.iter().enumerate() {
-            if stream["codec_type"] == "audio" {
-                let mut channel_layout = stream["channel_layout"].as_str().unwrap();
-                if channel_layout.ends_with("(side)") {
-                    let len = channel_layout.len();
-                    channel_layout = &channel_layout[0..len - "(side)".len()];
-                }
-                channel_map.push(format!(
-                    "[:{}]channelmap=channel_layout='{}'",
-                    i, channel_layout
-                ));
-                let channels = stream["channels"].as_u64().unwrap();
-                let bitrate = channels * 42;
-                audio_encode
-                    .arg(format!("-b:a:{}", audio_index))
-                    .arg(format!("{}K", bitrate));
-                audio_index += 1;
-            }
-        }
-        audio_encode
-            .arg("-filter_complex")
-            .arg(channel_map.join(";"))
-            .arg("-c:s")
-            .arg(subtitles)
-            .arg(format!("{}/audio.mkv", tmp_folder));
+        let audio_encode = audio_encode_command(&i, streams, &tmp_folder);
         let mut child = TrackedChild::spawn(audio_encode).unwrap();
         child.wait().await.unwrap();
         permits.add_permits(1);
     })
+}
+
+fn audio_encode_command(input: &str, streams: &[Value], tmp_folder: &str) -> Command {
+    let mut audio_encode = Command::new("ffmpeg");
+    let subtitles = if input.ends_with("mp4") {
+        "srt"
+    } else {
+        "copy"
+    };
+    audio_encode
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-map")
+        .arg("0")
+        .arg("-vn")
+        .arg("-c:a")
+        .arg("libopus")
+        .arg("-vbr")
+        .arg("on");
+    let mut channel_map = Vec::new();
+    let mut audio_index = 0;
+    for (i, stream) in streams.iter().enumerate() {
+        if stream["codec_type"] == "audio" {
+            let mut channel_layout = stream["channel_layout"].as_str().unwrap();
+            if channel_layout.ends_with("(side)") {
+                let len = channel_layout.len();
+                channel_layout = &channel_layout[0..len - "(side)".len()];
+            }
+            channel_map.push(format!(
+                "[:{}]channelmap=channel_layout='{}'",
+                i, channel_layout
+            ));
+            let channels = stream["channels"].as_u64().unwrap();
+            let bitrate = channels * 42;
+            audio_encode
+                .arg(format!("-b:a:{}", audio_index))
+                .arg(format!("{}K", bitrate));
+            audio_index += 1;
+        }
+    }
+    audio_encode
+        .arg("-filter_complex")
+        .arg(channel_map.join(";"))
+        .arg("-c:s")
+        .arg(subtitles)
+        .arg(format!("{}/audio.mkv", tmp_folder));
+    audio_encode
 }
 
 fn process(
@@ -1025,6 +1036,45 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn audio_encode_does_not_read_from_stdin() {
+        let streams = [
+            serde_json::json!({"codec_type": "video"}),
+            serde_json::json!({"codec_type": "audio", "channel_layout": "5.1(side)", "channels": 6}),
+        ];
+
+        let command = audio_encode_command("video.mkv", &streams, "/tmp/0");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-nostdin",
+                "-y",
+                "-i",
+                "video.mkv",
+                "-map",
+                "0",
+                "-vn",
+                "-c:a",
+                "libopus",
+                "-vbr",
+                "on",
+                "-b:a:0",
+                "252K",
+                "-filter_complex",
+                "[:1]channelmap=channel_layout='5.1'",
+                "-c:s",
+                "copy",
+                "/tmp/0/audio.mkv"
+            ]
+        );
     }
 
     #[test]
