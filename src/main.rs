@@ -330,30 +330,23 @@ fn audio_encode_command(input: &str, streams: &[Value], tmp_folder: &str) -> Com
         .arg("libopus")
         .arg("-vbr")
         .arg("on");
-    let mut channel_map = Vec::new();
-    let mut audio_index = 0;
-    for (i, stream) in streams.iter().enumerate() {
-        if stream["codec_type"] == "audio" {
-            let mut channel_layout = stream["channel_layout"].as_str().unwrap();
-            if channel_layout.ends_with("(side)") {
-                let len = channel_layout.len();
-                channel_layout = &channel_layout[0..len - "(side)".len()];
-            }
-            channel_map.push(format!(
-                "[:{}]channelmap=channel_layout='{}'",
-                i, channel_layout
-            ));
-            let channels = stream["channels"].as_u64().unwrap();
-            let bitrate = channels * 42;
+    let audio_streams = streams
+        .iter()
+        .filter(|stream| stream["codec_type"] == "audio");
+    for (audio_index, stream) in audio_streams.enumerate() {
+        let channels = stream["channels"].as_u64().unwrap();
+        let bitrate = channels * 42;
+        audio_encode
+            .arg(format!("-b:a:{}", audio_index))
+            .arg(format!("{}K", bitrate));
+        if let Some(layout) = stream["channel_layout"].as_str() {
+            let channel_layout = layout.strip_suffix("(side)").unwrap_or(layout);
             audio_encode
-                .arg(format!("-b:a:{}", audio_index))
-                .arg(format!("{}K", bitrate));
-            audio_index += 1;
+                .arg(format!("-filter:a:{}", audio_index))
+                .arg(format!("channelmap=channel_layout='{}'", channel_layout));
         }
     }
     audio_encode
-        .arg("-filter_complex")
-        .arg(channel_map.join(";"))
         .arg("-c:s")
         .arg(subtitles)
         .arg(format!("{}/audio.mkv", tmp_folder));
@@ -1172,8 +1165,87 @@ mod tests {
                 "on",
                 "-b:a:0",
                 "252K",
-                "-filter_complex",
-                "[:1]channelmap=channel_layout='5.1'",
+                "-filter:a:0",
+                "channelmap=channel_layout='5.1'",
+                "-c:s",
+                "copy",
+                "/tmp/0/audio.mkv"
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_encode_maps_channels_per_output_audio_stream() {
+        let streams = [
+            serde_json::json!({"codec_type": "video"}),
+            serde_json::json!({"codec_type": "audio", "channel_layout": "5.1(side)", "channels": 6}),
+            serde_json::json!({"codec_type": "subtitle"}),
+            serde_json::json!({"codec_type": "audio", "channel_layout": "stereo", "channels": 2}),
+        ];
+
+        let command = audio_encode_command("video.mkv", &streams, "/tmp/0");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-nostdin",
+                "-y",
+                "-i",
+                "video.mkv",
+                "-map",
+                "0",
+                "-vn",
+                "-c:a",
+                "libopus",
+                "-vbr",
+                "on",
+                "-b:a:0",
+                "252K",
+                "-filter:a:0",
+                "channelmap=channel_layout='5.1'",
+                "-b:a:1",
+                "84K",
+                "-filter:a:1",
+                "channelmap=channel_layout='stereo'",
+                "-c:s",
+                "copy",
+                "/tmp/0/audio.mkv"
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_encode_skips_channel_map_for_unknown_layout() {
+        let streams = [serde_json::json!({"codec_type": "audio", "channels": 6})];
+
+        let command = audio_encode_command("video.mkv", &streams, "/tmp/0");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "-nostdin",
+                "-y",
+                "-i",
+                "video.mkv",
+                "-map",
+                "0",
+                "-vn",
+                "-c:a",
+                "libopus",
+                "-vbr",
+                "on",
+                "-b:a:0",
+                "252K",
                 "-c:s",
                 "copy",
                 "/tmp/0/audio.mkv"
