@@ -413,6 +413,8 @@ RUN meson "../VapourSynth" && \
     ninja install
 
 FROM runtime
+ARG UID=1000
+ARG GID=1000
 WORKDIR /sav1n
 
 COPY --from=vapoursynth /usr/local/lib/*.so* /usr/local/lib/
@@ -446,6 +448,7 @@ COPY --from=rustbuild /sav1n/target/release/sav1n .
 ENV PATH="/sav1n:/usr/local/bin:${PATH}"
 ENV PYTHONPATH=/usr/local/lib/python3.13/dist-packages
 ENV VAPOURSYNTH_EXTRA_PLUGIN_PATH=/usr/local/lib/vapoursynth
+ENV XDG_CONFIG_HOME=/etc/xdg
 RUN x265 --version && \
     ffmpeg -hide_banner -encoders | grep -q libx265
 RUN printf '%s\n' \
@@ -459,4 +462,9 @@ RUN mkdir -p /etc/OpenCL/vendors && \
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 WORKDIR /video
+RUN (getent group "$GID" > /dev/null || groupadd --gid "$GID" sav1n) && \
+    useradd --non-unique --uid "$UID" --gid "$GID" --create-home --shell /bin/bash sav1n && \
+    chown "$UID:$GID" /video
+ENV HOME=/home/sav1n
+USER sav1n
 ENTRYPOINT ["sav1n"]

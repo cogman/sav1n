@@ -19,4 +19,17 @@ The easiest way to start using sav1n is through docker:
 docker run -v `pwd`:/video -it --rm cogman/sav1n:latest -i test.vpy
 ```
 
+The image runs as an unprivileged user, so files written to `/video` are owned by that user instead of root.
+The UID and GID default to `1000`. To match a different host user, override them at runtime:
+
+```bash
+docker run --user $(id -u):$(id -g) -v `pwd`:/video -it --rm cogman/sav1n:latest -i test.vpy
+```
+
+or when building the image:
+
+```bash
+docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t sav1n .
+```
+
 Sending `SIGINT` (Ctrl-C) or `SIGTERM` stops all child encoders, gives them a short grace period, and removes temporary folders before exiting.
