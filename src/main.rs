@@ -1,5 +1,6 @@
 mod aom_firstpass;
 mod av1_encoder;
+mod cq_search;
 mod encoder;
 mod frame;
 mod frame_buffer;
@@ -548,18 +549,64 @@ async fn compress_scene(
             }
             drop(guard);
         }
-        let cq = vmaf_secant_search(
-            10,
-            encoder.max_cq(),
-            initial_min,
-            initial_max,
-            vmaf_cpu_used,
-            vmaf_target,
-            scene_number,
-            tmp_folder.clone(),
-            encoder.clone(),
+        let (initial_min_vmaf, initial_max_vmaf) = join!(
+            vmaf_second_pass(
+                scene_number,
+                initial_min,
+                6,
+                1,
+                tmp_folder.clone(),
+                encoder.clone(),
+            ),
+            vmaf_second_pass(
+                scene_number,
+                initial_max,
+                6,
+                1,
+                tmp_folder.clone(),
+                encoder.clone(),
+            ),
+        );
+
+        let config = cq_search::SearchConfig {
+            min: 10,
+            max: encoder.max_cq(),
+            target: vmaf_target,
+            tolerance: 0.005,
+            max_new_evaluations: 10,
+        };
+        let search_tmp_folder = tmp_folder.clone();
+        let search_encoder = encoder.clone();
+        let outcome = cq_search::search(
+            &config,
+            &[
+                cq_search::Sample {
+                    cq: initial_min,
+                    vmaf: initial_min_vmaf,
+                },
+                cq_search::Sample {
+                    cq: initial_max,
+                    vmaf: initial_max_vmaf,
+                },
+            ],
+            move |cq| {
+                let tmp_folder = search_tmp_folder.clone();
+                let encoder = search_encoder.clone();
+                async move {
+                    vmaf_second_pass(scene_number, cq, vmaf_cpu_used, 2, tmp_folder, encoder).await
+                }
+            },
+            |sample| println!("{}: {}: {:.4}", scene_number, sample.cq, sample.vmaf),
         )
         .await;
+        println!(
+            "{}: chose {} ({} samples, converged: {})",
+            scene_number,
+            outcome.cq,
+            outcome.samples.len(),
+            outcome.converged
+        );
+        let cq = outcome.cq;
         encoding_scenes.add_permits(1);
         {
             let mut guard = prior_cq_values.lock().await;
@@ -722,98 +769,6 @@ async fn vmaf_second_pass(
     let capture: &str = &captures[1];
 
     capture.parse().map(|n: f64| n / 100.0).unwrap()
-}
-
-async fn vmaf_secant_search(
-    min: u32,
-    max: u32,
-    initial_guess_min: u32,
-    initial_guess_max: u32,
-    vmaf_cpu_used: u32,
-    target: f64,
-    scene_number: u32,
-    tmp_folder: String,
-    encoder: Arc<dyn Encoder + Send + Sync>,
-) -> u32 {
-    let mut x1 = initial_guess_min;
-    let mut x2 = initial_guess_max;
-    let f = tmp_folder.clone();
-    let f2 = tmp_folder.clone();
-    let e1 = encoder.clone();
-    let e2 = encoder.clone();
-    let first_fx1 =
-        task::spawn(async move { vmaf_second_pass(scene_number, x1, 6, 1, f.clone(), e1).await });
-    let first_fx2 =
-        task::spawn(async move { vmaf_second_pass(scene_number, x2, 6, 1, f2.clone(), e2).await });
-    let (fx1_result, fx2_result) = join!(first_fx1, first_fx2);
-    let fx1_target = fx1_result.unwrap() - target;
-    let mut fx1 = fx1_target;
-    let mut fx2 = fx2_result.unwrap() - target;
-    // If vmaf for the second value is greater then the target, then we want it pinned so future guess aren't lower than this first high guess.
-    // For example, if the guess is 40 with vmaf of 99 and a target of 95, a guess of 60 might return 80, which would make the next guess less than 40 (since it falls off naturally as a result of secant searching)
-    // This swap keeps the 40 for the next pass which will make the next guess > 40.
-    // This only applies to the first pass as subsequent guesses should always narrow into the right result.
-    if fx2.abs() < fx1.abs() {
-        fx1 = fx2;
-        x1 = x2;
-        fx2 = fx1_target;
-        x2 = initial_guess_min;
-    }
-    let mut iterations = 0;
-    while fx1.abs() > 0.005 && iterations < 10 {
-        let mut next = (x1 as f64 - (fx1 * ((x1 as f64 - x2 as f64) / (fx1 - fx2)))).floor() as u32;
-        println!(
-            "{}({}): {}:{} {}:{} → {}",
-            scene_number,
-            iterations,
-            x1,
-            fx1 + target,
-            x2,
-            fx2 + target,
-            next
-        );
-        x2 = x1;
-        fx2 = fx1;
-        if next < min {
-            if x1 == min {
-                // We already tried min.  No reason to try again.
-                break;
-            } else {
-                next = min
-            }
-        } else if next > max {
-            if x1 == max {
-                // We already tried max, don't try it again.
-                break;
-            } else {
-                next = max
-            }
-        } else if next == x1 {
-            // We are so close that the next guess ends up being the current guess, just jump out
-            break;
-        }
-        if x1 == max && fx1 > 0.0 {
-            break;
-        }
-        x1 = next;
-        fx1 = vmaf_second_pass(
-            scene_number,
-            x1,
-            vmaf_cpu_used,
-            2,
-            tmp_folder.clone(),
-            encoder.clone(),
-        )
-        .await
-            - target;
-        iterations += 1;
-    }
-    println!("{}: {}:{}", scene_number, x1, fx1 + target);
-    if fx1 > 0.0 {
-        x1
-    } else {
-        (x1 - 1).max(min)
-    }
 }
 
 fn stats_processor(
