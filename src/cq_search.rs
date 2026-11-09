@@ -4,7 +4,9 @@
 //! The evaluator is assumed to be non-increasing: raising `cq` never raises
 //! the score. The search keeps a bracket between the highest acceptable value
 //! and the lowest unacceptable value, and uses Brent-style inverse quadratic
-//! interpolation with secant and bisection fallbacks to shrink it.
+//! interpolation with secant and bisection fallbacks to shrink it. Callers
+//! using a lower-is-better distance must negate both their scores and target;
+//! tolerance remains in the original distance units.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,7 +14,7 @@ use std::future::Future;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
     pub cq: u32,
-    pub vmaf: f64,
+    pub score: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +61,10 @@ where
 {
     assert!(config.min <= config.max, "search range is empty");
     assert!(config.target.is_finite(), "target must be finite");
+    assert!(
+        config.tolerance.is_finite() && config.tolerance >= 0.0,
+        "tolerance must be finite and nonnegative"
+    );
 
     let target = config.target;
     let mut cache: HashMap<u32, f64> = HashMap::new();
@@ -71,7 +77,8 @@ where
         if cache.contains_key(&sample.cq) {
             continue;
         }
-        cache.insert(sample.cq, sample.vmaf);
+        assert!(sample.score.is_finite(), "sample score must be finite");
+        cache.insert(sample.cq, sample.score);
         samples.push(*sample);
         report(sample);
     }
@@ -89,7 +96,7 @@ where
     // An initial probe may already be close enough to the target.
     if config.tolerance > 0.0 {
         if let Some(sample) = best_acceptable(&samples, target)
-            .filter(|sample| sample.vmaf - target <= config.tolerance)
+            .filter(|sample| sample.score - target <= config.tolerance)
         {
             return SearchOutcome {
                 cq: sample.cq,
@@ -156,7 +163,7 @@ where
         };
     }
 
-    if config.tolerance > 0.0 && lo.vmaf - target <= config.tolerance {
+    if config.tolerance > 0.0 && lo.score - target <= config.tolerance {
         return SearchOutcome {
             cq: lo.cq,
             samples,
@@ -169,8 +176,8 @@ where
     let mut a = lo.cq as f64;
     let mut b = hi.cq as f64;
     let mut c = hi.cq as f64;
-    let mut fa = lo.vmaf - target;
-    let mut fb = hi.vmaf - target;
+    let mut fa = lo.score - target;
+    let mut fb = hi.score - target;
     let mut fc = fb;
     let mut d = b - a;
     let mut e = d;
@@ -259,10 +266,10 @@ where
         }
 
         budget -= 1;
-        let vmaf = eval_once(next_cq, &evaluate, &mut cache, &mut samples, &mut report).await;
+        let score = eval_once(next_cq, &evaluate, &mut cache, &mut samples, &mut report).await;
 
         b = next_cq as f64;
-        fb = vmaf - target;
+        fb = score - target;
         // Keep Brent's step history consistent with the integer probe we
         // actually made (rounding/clamping may have changed the step).
         d = b - old_b;
@@ -275,7 +282,7 @@ where
             _ => break,
         }
 
-        if vmaf >= target && config.tolerance > 0.0 && vmaf - target <= config.tolerance {
+        if score >= target && config.tolerance > 0.0 && score - target <= config.tolerance {
             return SearchOutcome {
                 cq: lo.cq,
                 samples,
@@ -307,16 +314,17 @@ where
     Fut: Future<Output = f64>,
     R: FnMut(&Sample),
 {
-    if let Some(vmaf) = cache.get(&cq) {
-        return *vmaf;
+    if let Some(score) = cache.get(&cq) {
+        return *score;
     }
 
-    let vmaf = evaluate(cq).await;
-    cache.insert(cq, vmaf);
-    let sample = Sample { cq, vmaf };
+    let score = evaluate(cq).await;
+    assert!(score.is_finite(), "evaluator score must be finite");
+    cache.insert(cq, score);
+    let sample = Sample { cq, score };
     samples.push(sample);
     report(&sample);
-    vmaf
+    score
 }
 
 /// Returns the highest acceptable sample and the lowest unacceptable sample.
@@ -325,7 +333,7 @@ fn bracket(samples: &[Sample], target: f64) -> (Option<Sample>, Option<Sample>) 
     let mut unacceptable: Option<Sample> = None;
 
     for &sample in samples {
-        if sample.vmaf >= target {
+        if sample.score >= target {
             match acceptable {
                 Some(best) if sample.cq <= best.cq => {}
                 _ => acceptable = Some(sample),
@@ -345,7 +353,7 @@ fn best_acceptable(samples: &[Sample], target: f64) -> Option<Sample> {
     samples
         .iter()
         .copied()
-        .filter(|sample| sample.vmaf >= target)
+        .filter(|sample| sample.score >= target)
         .max_by_key(|sample| sample.cq)
 }
 
@@ -366,6 +374,35 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    #[should_panic(expected = "evaluator score must be finite")]
+    async fn rejects_nonfinite_evaluation() {
+        search(&config(10, 50, 90.0), &[], |_| async { f64::NAN }, |_| {}).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sample score must be finite")]
+    async fn rejects_nonfinite_seed() {
+        search(
+            &config(10, 50, 90.0),
+            &[Sample {
+                cq: 20,
+                score: f64::INFINITY,
+            }],
+            |_| async { 95.0 },
+            |_| {},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "tolerance must be finite and nonnegative")]
+    async fn rejects_negative_tolerance() {
+        let mut settings = config(10, 50, 90.0);
+        settings.tolerance = -0.5;
+        search(&settings, &[], |_| async { 95.0 }, |_| {}).await;
+    }
 
     fn config(min: u32, max: u32, target: f64) -> SearchConfig {
         SearchConfig {
@@ -435,11 +472,11 @@ mod tests {
         let initial = [
             Sample {
                 cq: 10,
-                vmaf: linear(10),
+                score: linear(10),
             },
             Sample {
                 cq: 15,
-                vmaf: linear(15),
+                score: linear(15),
             },
         ];
         let (outcome, _) = run(&cfg, &initial, linear).await;
@@ -500,7 +537,10 @@ mod tests {
     #[tokio::test]
     async fn min_equal_to_max_is_supported() {
         let cfg = config(30, 30, 95.0);
-        let initial = [Sample { cq: 30, vmaf: 96.0 }];
+        let initial = [Sample {
+            cq: 30,
+            score: 96.0,
+        }];
         let (outcome, _) = run(&cfg, &initial, |_| 96.0).await;
 
         assert_eq!(outcome.cq, 30);
@@ -512,13 +552,16 @@ mod tests {
         let cfg = config(10, 60, 90.0);
         let expected = brute_force(cfg.min, cfg.max, cfg.target, linear);
         let initial = [
-            Sample { cq: 0, vmaf: 100.0 },
+            Sample {
+                cq: 0,
+                score: 100.0,
+            },
             Sample {
                 cq: 20,
-                vmaf: linear(20),
+                score: linear(20),
             },
-            Sample { cq: 20, vmaf: 0.0 },
-            Sample { cq: 70, vmaf: 0.0 },
+            Sample { cq: 20, score: 0.0 },
+            Sample { cq: 70, score: 0.0 },
         ];
         let (outcome, _) = run(&cfg, &initial, linear).await;
 
@@ -541,7 +584,7 @@ mod tests {
         let score = |cq: u32| 90.006 - (cq as f64 - 40.0) * 0.1;
         let initial = [Sample {
             cq: 40,
-            vmaf: 90.006,
+            score: 90.006,
         }];
         let (outcome, calls) = run(&cfg, &initial, score).await;
 

@@ -228,13 +228,13 @@ mod tests {
     #[tokio::test]
     async fn wait_with_output_unregisters_child() {
         let _guard = TEST_LOCK.lock().await;
-        let output = TrackedChild::spawn(Command::new("true"))
-            .unwrap()
-            .wait_with_output()
-            .await
-            .unwrap();
+        let child = TrackedChild::spawn(Command::new("true")).unwrap();
+        let pid = child.id().expect("child should have a pid");
+        assert!(active_children().contains(&pid));
+        let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success());
-        assert!(active_children().is_empty());
+        // Other tests can have their own tracked children running concurrently.
+        assert!(!active_children().contains(&pid));
     }
 
     #[tokio::test]

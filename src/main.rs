@@ -4,6 +4,7 @@ mod cq_search;
 mod encoder;
 mod frame;
 mod frame_buffer;
+mod metric;
 mod shutdown;
 mod video_header;
 mod vp9_encoder;
@@ -13,10 +14,10 @@ use crate::aom_firstpass::aom::AomFirstpass;
 use crate::frame::Frame;
 use crate::frame::Status::Processing;
 use crate::frame_buffer::FrameBuffer;
+use crate::metric::{MetricConfig, MetricKind, PreparedReference};
 use crate::shutdown::TrackedChild;
 use crate::video_header::VideoHeader;
 use clap::{value_parser, Arg, ArgMatches, Command as ClapCommand};
-use regex::{Captures, Regex};
 use serde_json::Value;
 
 use crate::av1_encoder::Av1Encoder;
@@ -31,7 +32,7 @@ use std::ops::{BitAnd, Not};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::fs::{create_dir, remove_dir_all, remove_file};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader, ErrorKind};
@@ -62,9 +63,9 @@ async fn main() {
 
     let encoders = *options.get_one::<usize>("encoders").unwrap();
     let cpu_used = *options.get_one::<u32>("cpu_used").unwrap();
-    let vmaf_cpu_used = *options.get_one::<u32>("vmaf_cpu_used").unwrap();
+    let trial_cpu_used = *options.get_one::<u32>("trial_cpu_used").unwrap();
     let vpy: String = options.get_one::<String>("vpy").unwrap().clone();
-    let vmaf_target: f64 = *options.get_one::<f64>("vmaf_target").unwrap() / 100.0;
+    let metric = Arc::new(metric_options(&options));
     let encoder_str: String = options.get_one::<String>("codec").unwrap().clone();
     let encoder: Arc<dyn Encoder + Send + Sync> = match encoder_str.as_str() {
         "vpx" => Arc::new(Vp9Encoder {}),
@@ -84,13 +85,14 @@ async fn main() {
         let entry = entry.clone();
         let cdn = can_do_next.clone();
         let e = encoder.clone();
+        let metric = metric.clone();
 
         tasks.push(tokio::spawn(async move {
             compress_file(
                 cpu_used,
-                vmaf_cpu_used,
+                trial_cpu_used,
                 vpy,
-                vmaf_target,
+                metric,
                 active_encodes,
                 entry,
                 cdn,
@@ -118,9 +120,9 @@ async fn main() {
 
 async fn compress_file(
     cpu_used: u32,
-    vmaf_cpu_used: u32,
+    trial_cpu_used: u32,
     vpy: String,
-    vmaf_target: f64,
+    metric: Arc<MetricConfig>,
     active_encoders: Arc<Semaphore>,
     input_path: PathBuf,
     can_do_next: Arc<Semaphore>,
@@ -165,9 +167,9 @@ async fn compress_file(
         buffer.clone(),
         header.clone(),
         active_encoders.clone(),
-        vmaf_target,
+        metric,
         cpu_used,
-        vmaf_cpu_used,
+        trial_cpu_used,
         tmp_folder.clone(),
         encoder,
     );
@@ -359,9 +361,9 @@ fn process(
     scene_buffer: Arc<FrameBuffer>,
     header: VideoHeader,
     active_encodes_vpx: Arc<Semaphore>,
-    vmaf_target: f64,
+    metric: Arc<MetricConfig>,
     cpu_used: u32,
-    vmaf_cpu_used: u32,
+    trial_cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> JoinHandle<u32> {
@@ -380,9 +382,9 @@ fn process(
                         std::mem::replace(&mut file, next_file).close(),
                         active_encodes_vpx.clone(),
                         prior_cq_values.clone(),
-                        vmaf_target,
+                        metric.clone(),
                         cpu_used,
-                        vmaf_cpu_used,
+                        trial_cpu_used,
                         tmp_folder.clone(),
                         encoder.clone(),
                     )
@@ -406,9 +408,9 @@ fn process(
                 file.close(),
                 active_encodes_vpx.clone(),
                 prior_cq_values.clone(),
-                vmaf_target,
+                metric,
                 cpu_used,
-                vmaf_cpu_used,
+                trial_cpu_used,
                 tmp_folder.clone(),
                 encoder,
             )
@@ -522,20 +524,27 @@ async fn compress_scene(
     scene_file: SceneFile,
     encoding_scenes: Arc<Semaphore>,
     prior_cq_values: Arc<Mutex<Vec<u32>>>,
-    vmaf_target: f64,
+    metric: Arc<MetricConfig>,
     cpu_used: u32,
-    vmaf_cpu_used: u32,
+    trial_cpu_used: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> JoinHandle<()> {
-    encoding_scenes.acquire_many(2).await.unwrap().forget();
+    let mut permits = encoding_scenes.acquire_many_owned(2).await.unwrap();
     tokio::spawn(async move {
         scene_file.wait().await;
-        if let Some(mut first_pass) =
-            first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await
-        {
-            first_pass.wait().await;
-        }
+        let first_pass = async {
+            if let Some(mut first_pass) =
+                first_pass(scene_number, tmp_folder.clone(), encoder.clone()).await
+            {
+                first_pass.wait().await;
+            }
+        };
+        let (_, reference) = join!(
+            first_pass,
+            prepare_reference(scene_number, &tmp_folder, &metric)
+        );
+        let reference = Arc::new(reference);
         let mut initial_min = 20;
         let mut initial_max = 40;
         {
@@ -549,65 +558,99 @@ async fn compress_scene(
             }
             drop(guard);
         }
-        let (initial_min_vmaf, initial_max_vmaf) = join!(
-            vmaf_second_pass(
+        let (initial_min_score, initial_max_score) = join!(
+            evaluate_trial(
                 scene_number,
                 initial_min,
                 6,
                 1,
                 tmp_folder.clone(),
                 encoder.clone(),
+                metric.clone(),
+                reference.clone(),
             ),
-            vmaf_second_pass(
+            evaluate_trial(
                 scene_number,
                 initial_max,
                 6,
                 1,
                 tmp_folder.clone(),
                 encoder.clone(),
+                metric.clone(),
+                reference.clone(),
             ),
         );
 
         let config = cq_search::SearchConfig {
             min: 10,
             max: encoder.max_cq(),
-            target: vmaf_target,
-            tolerance: 0.005,
+            target: metric.search_target(),
+            tolerance: metric.search_tolerance(),
             max_new_evaluations: 10,
         };
         let search_tmp_folder = tmp_folder.clone();
         let search_encoder = encoder.clone();
+        let search_metric = metric.clone();
+        let search_reference = reference.clone();
         let outcome = cq_search::search(
             &config,
             &[
                 cq_search::Sample {
                     cq: initial_min,
-                    vmaf: initial_min_vmaf,
+                    score: initial_min_score,
                 },
                 cq_search::Sample {
                     cq: initial_max,
-                    vmaf: initial_max_vmaf,
+                    score: initial_max_score,
                 },
             ],
             move |cq| {
                 let tmp_folder = search_tmp_folder.clone();
                 let encoder = search_encoder.clone();
+                let metric = search_metric.clone();
+                let reference = search_reference.clone();
                 async move {
-                    vmaf_second_pass(scene_number, cq, vmaf_cpu_used, 2, tmp_folder, encoder).await
+                    evaluate_trial(
+                        scene_number,
+                        cq,
+                        trial_cpu_used,
+                        2,
+                        tmp_folder,
+                        encoder,
+                        metric,
+                        reference,
+                    )
+                    .await
                 }
             },
-            |sample| println!("{}: {}: {:.4}", scene_number, sample.cq, sample.vmaf),
+            |sample| {
+                // The Butteraugli sign conversion is its own inverse.
+                let native_score = metric.kind.search_score(sample.score);
+                println!(
+                    "{}: CQ {}: {} {:.4} (target {:.4})",
+                    scene_number,
+                    sample.cq,
+                    metric.kind.name(),
+                    native_score,
+                    metric.target
+                );
+            },
         )
         .await;
+        let target_met = outcome
+            .samples
+            .iter()
+            .any(|sample| sample.cq == outcome.cq && sample.score >= config.target);
         println!(
-            "{}: chose {} ({} samples, converged: {})",
+            "{}: chose {} ({} samples, converged: {}, target met: {})",
             scene_number,
             outcome.cq,
             outcome.samples.len(),
-            outcome.converged
+            outcome.converged,
+            target_met
         );
         let cq = outcome.cq;
-        encoding_scenes.add_permits(1);
+        drop(permits.split(1));
         {
             let mut guard = prior_cq_values.lock().await;
             let insertion_index = guard.binary_search(&cq).unwrap_or_else(|x| x);
@@ -624,7 +667,7 @@ async fn compress_scene(
         .await;
         second.wait().await;
         drop(second);
-        encoding_scenes.add_permits(1);
+        drop(permits);
         cleanup(scene_number, tmp_folder).await;
     })
 }
@@ -681,94 +724,110 @@ async fn cleanup(scene_number: u32, tmp_folder: String) {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
     let remove_video = remove_file(format!("{}.mkv", scene_str));
     let remove_scene = remove_file(format!("{}.log", scene_str));
-    let (video, scene) = join!(remove_video, remove_scene);
+    let remove_metric = remove_dir_all(format!("{}.metric", scene_str));
+    let (video, scene, metric) = join!(remove_video, remove_scene, remove_metric);
     video.unwrap();
-    if let Err(e) = scene {
-        if e.kind() != ErrorKind::NotFound {
-            panic!("Failed to remove {}.log: {}", scene_str, e);
+    for (result, name) in [(scene, "log"), (metric, "metric")] {
+        if let Err(e) = result {
+            if e.kind() != ErrorKind::NotFound {
+                panic!("Failed to remove {}.{}: {}", scene_str, name, e);
+            }
         }
     }
 }
 
-fn vmaf_command(container_format: &str, scene_path: &str) -> Command {
-    let mut command = Command::new("ffmpeg");
-    command
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .arg("-y")
-        .arg("-f")
-        .arg(container_format)
-        .arg("-i")
-        .arg("pipe:0")
-        .arg("-threads")
-        .arg(FFV1_DECODE_THREADS)
-        .arg("-i")
-        .arg(scene_path)
-        .arg("-threads")
-        .arg("1")
-        .arg("-lavfi")
-        // Matroska rounds timestamps to milliseconds, so pair frames by index instead.
-        .arg(concat!(
-            "[0:v]settb=AVTB,setpts=N[distorted];",
-            "[1:v]settb=AVTB,setpts=N[reference];",
-            "[distorted][reference]libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'"
-        ))
-        .arg("-f")
-        .arg("null")
-        .arg("-");
-    command
+/// Probe the scene reference once; trials share it and the `.metric` directory.
+async fn prepare_reference(
+    scene_number: u32,
+    tmp_folder: &str,
+    metric: &MetricConfig,
+) -> PreparedReference {
+    let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
+    let work_dir = PathBuf::from(format!("{}.metric", scene_str));
+    match metric
+        .prepare_reference(&format!("{}.mkv", scene_str), &work_dir)
+        .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            let _ = remove_dir_all(&work_dir).await;
+            panic!(
+                "{} reference preparation failed for scene {}: {}",
+                metric.kind.name(),
+                scene_number,
+                error
+            )
+        }
+    }
 }
 
-async fn vmaf_second_pass(
+/// Encode once, then let the selected metric prepare and compare its inputs.
+/// Each probe owns its directory, including the two probes run concurrently.
+async fn evaluate_trial(
     scene_number: u32,
     cq: u32,
     cpu_used: u32,
     threads: u32,
     tmp_folder: String,
     encoder: Arc<dyn Encoder + Send + Sync>,
+    metric: Arc<MetricConfig>,
+    reference: Arc<PreparedReference>,
 ) -> f64 {
     let scene_str = format!("{}/{:06}", tmp_folder, scene_number);
     let scene_path = format!("{}.mkv", scene_str);
-    let mut command = encoder.second_pass(EncoderOptions {
-        cq,
-        cpu_used,
-        threads,
-        log_file: format!("{}.log", scene_str).as_str(),
-        output: "-",
-        input: "-",
-        ..Default::default()
+    let work_dir = PathBuf::from(format!("{}.probe-{}", scene_str, cq));
+    create_dir(&work_dir)
+        .await
+        .expect("failed to create metric workspace");
+    let trial_path = work_dir.join(format!("trial.{}", encoder.container_format()));
+    let result: Result<f64, String> = async {
+        let mut command = encoder.second_pass(EncoderOptions {
+            cq,
+            cpu_used,
+            threads,
+            log_file: format!("{}.log", scene_str).as_str(),
+            output: trial_path.to_str().unwrap(),
+            input: "-",
+            ..Default::default()
+        });
+        let mut decoder = TrackedChild::spawn(ffv1_decoder_command(&scene_path))
+            .map_err(|error| format!("failed to start trial reference decoder: {error}"))?;
+        let decoder_stdout: Stdio = decoder
+            .stdout
+            .take()
+            .expect("reference decoder stdout is piped")
+            .try_into()
+            .map_err(|error| format!("failed to pipe reference decoder: {error}"))?;
+        command.stdin(decoder_stdout);
+        let mut encode = TrackedChild::spawn(command)
+            .map_err(|error| format!("failed to start trial encoder: {error}"))?;
+        let (encode_status, decoder_status) = join!(encode.wait(), decoder.wait());
+        let encode_status = encode_status.map_err(|e| e.to_string())?;
+        let decoder_status = decoder_status.map_err(|e| e.to_string())?;
+        if !encode_status.success() {
+            return Err(format!("trial encoder failed ({encode_status})"));
+        }
+        if !decoder_status.success() {
+            return Err(format!("trial reference decoder failed ({decoder_status})"));
+        }
+        metric
+            .evaluate(&reference, trial_path.to_str().unwrap(), &work_dir)
+            .await
+    }
+    .await;
+    let cleanup = remove_dir_all(&work_dir).await;
+    let score = result.unwrap_or_else(|error| {
+        panic!(
+            "{} evaluation failed for scene {} CQ {}: {}",
+            metric.kind.name(),
+            scene_number,
+            cq,
+            error
+        )
     });
-    let mut decoder = start_ffv1_decoder(&scene_path);
-    let decoder_stdout: Stdio = decoder.stdout.take().unwrap().try_into().unwrap();
-    command.stdin(decoder_stdout);
-    command.stdout(Stdio::piped());
-    let mut encode = TrackedChild::spawn(command).unwrap();
-
-    let encode_stdin: Stdio = encode
-        .stdout
-        .take()
-        .unwrap()
-        .try_into()
-        .expect("failed to convert to Stdio");
-
-    let mut ffmpeg_command = vmaf_command(encoder.container_format(), &scene_path);
-    ffmpeg_command.stdin(encode_stdin);
-    let ffmpeg = TrackedChild::spawn(ffmpeg_command).unwrap();
-
-    let (encode_status, decoder_status, ffmpeg_output) =
-        join!(encode.wait(), decoder.wait(), ffmpeg.wait_with_output());
-    assert!(encode_status.unwrap().success(), "encoder failed");
-    assert!(decoder_status.unwrap().success(), "ffmpeg decoder failed");
-
-    static VMAF_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"VMAF score:\s+([\d|.]+)").unwrap());
-    let results = String::from_utf8(ffmpeg_output.unwrap().stderr).unwrap();
-    let captures: Captures = VMAF_RE
-        .captures(results.as_str())
-        .unwrap_or_else(|| panic!("Failed to decode: {}", results));
-    let capture: &str = &captures[1];
-
-    capture.parse().map(|n: f64| n / 100.0).unwrap()
+    cleanup.expect("failed to remove metric workspace");
+    assert!(score.is_finite(), "metric returned a non-finite score");
+    metric.kind.search_score(score)
 }
 
 fn stats_processor(
@@ -961,11 +1020,45 @@ fn cli() -> ClapCommand {
                 .value_parser(value_parser!(usize)),
         )
         .arg(
-            Arg::new("vmaf_target")
+            Arg::new("metric")
+                .long("metric")
+                .help("Quality metric used for per-scene CQ search")
+                .default_value("vmaf")
+                .value_parser(["vmaf", "cvvdp", "butteraugli"]),
+        )
+        .arg(
+            Arg::new("target")
                 .short('t')
-                .long("vmaf_target")
-                .default_value("95")
-                .value_parser(value_parser!(f64)),
+                .long("target")
+                .visible_alias("vmaf_target")
+                .help("Target in native metric units (VMAF defaults to 95)")
+                .default_value_if("metric", "vmaf", "95")
+                .required_if_eq("metric", "cvvdp")
+                .required_if_eq("metric", "butteraugli")
+                .allow_negative_numbers(true)
+                .value_parser(finite_score),
+        )
+        .arg(
+            Arg::new("tolerance")
+                .long("tolerance")
+                .help("Acceptable distance from target; 0 fully resolves the CQ bracket")
+                .default_value_if("metric", "vmaf", "0.5")
+                .default_value_if("metric", "cvvdp", "0.05")
+                .default_value_if("metric", "butteraugli", "0.05")
+                .value_parser(nonnegative_score),
+        )
+        .arg(
+            Arg::new("cvvdp_display")
+                .long("cvvdp-display")
+                .help("CVVDP display model; select a matching model for HDR content")
+                .default_value("standard_fhd"),
+        )
+        .arg(
+            Arg::new("cvvdp_device")
+                .long("cvvdp-device")
+                .help("CVVDP compute device: cpu or a GPU index (e.g. 0)")
+                .default_value("cpu")
+                .value_parser(cvvdp_device),
         )
         .arg(
             Arg::new("cpu_used")
@@ -975,8 +1068,10 @@ fn cli() -> ClapCommand {
                 .value_parser(value_parser!(u32)),
         )
         .arg(
-            Arg::new("vmaf_cpu_used")
-                .long("vmaf_cpu_used")
+            Arg::new("trial_cpu_used")
+                .long("trial-cpu-used")
+                .visible_alias("vmaf_cpu_used")
+                .help("Encoder speed for quality-search trials, not metric compute settings")
                 .default_value("3")
                 .value_parser(value_parser!(u32)),
         )
@@ -987,6 +1082,46 @@ fn cli() -> ClapCommand {
                 .default_value("vpx")
                 .value_parser(["vpx", "av1", "x265"]),
         )
+}
+
+fn finite_score(value: &str) -> Result<f64, String> {
+    let score = value.parse::<f64>().map_err(|e| e.to_string())?;
+    if !score.is_finite() {
+        return Err("score must be finite".into());
+    }
+    Ok(score)
+}
+
+fn nonnegative_score(value: &str) -> Result<f64, String> {
+    let score = finite_score(value)?;
+    if score < 0.0 {
+        return Err("value must be nonnegative".into());
+    }
+    Ok(score)
+}
+
+fn cvvdp_device(value: &str) -> Result<String, String> {
+    if value == "cpu" || value.parse::<u32>().is_ok() {
+        Ok(value.to_string())
+    } else {
+        Err("device must be cpu or a nonnegative GPU index".into())
+    }
+}
+
+fn metric_options(options: &ArgMatches) -> MetricConfig {
+    let kind = match options.get_one::<String>("metric").unwrap().as_str() {
+        "vmaf" => MetricKind::Vmaf,
+        "cvvdp" => MetricKind::Cvvdp,
+        "butteraugli" => MetricKind::Butteraugli,
+        _ => unreachable!("validated by clap"),
+    };
+    MetricConfig {
+        kind,
+        target: *options.get_one::<f64>("target").unwrap(),
+        tolerance: *options.get_one::<f64>("tolerance").unwrap(),
+        display: options.get_one::<String>("cvvdp_display").unwrap().clone(),
+        device: options.get_one::<String>("cvvdp_device").unwrap().clone(),
+    }
 }
 
 fn extract_options() -> ArgMatches {
@@ -1040,9 +1175,9 @@ mod tests {
         assert_eq!(inputs, ["one.mkv", "two.mkv"]);
         assert_eq!(matches.get_one::<String>("vpy").unwrap(), "script.vpy");
         assert_eq!(*matches.get_one::<usize>("encoders").unwrap(), 12);
-        assert_eq!(*matches.get_one::<f64>("vmaf_target").unwrap(), 95.0);
+        assert_eq!(*matches.get_one::<f64>("target").unwrap(), 95.0);
         assert_eq!(*matches.get_one::<u32>("cpu_used").unwrap(), 0);
-        assert_eq!(*matches.get_one::<u32>("vmaf_cpu_used").unwrap(), 3);
+        assert_eq!(*matches.get_one::<u32>("trial_cpu_used").unwrap(), 3);
         assert_eq!(matches.get_one::<String>("codec").unwrap(), "vpx");
     }
 
@@ -1069,10 +1204,133 @@ mod tests {
             .unwrap();
 
         assert_eq!(*matches.get_one::<usize>("encoders").unwrap(), 4);
-        assert_eq!(*matches.get_one::<f64>("vmaf_target").unwrap(), 92.0);
+        assert_eq!(*matches.get_one::<f64>("target").unwrap(), 92.0);
         assert_eq!(*matches.get_one::<u32>("cpu_used").unwrap(), 2);
-        assert_eq!(*matches.get_one::<u32>("vmaf_cpu_used").unwrap(), 5);
+        assert_eq!(*matches.get_one::<u32>("trial_cpu_used").unwrap(), 5);
         assert_eq!(matches.get_one::<String>("codec").unwrap(), "x265");
+    }
+
+    #[test]
+    fn parses_metric_targets_in_native_units() {
+        for (name, kind, target, tolerance) in [
+            ("vmaf", MetricKind::Vmaf, "95", 0.5),
+            ("cvvdp", MetricKind::Cvvdp, "8", 0.05),
+            ("butteraugli", MetricKind::Butteraugli, "1.5", 0.05),
+        ] {
+            let matches = cli()
+                .try_get_matches_from([
+                    "sav1n",
+                    "-i",
+                    "input.mkv",
+                    "-v",
+                    "script.vpy",
+                    "--metric",
+                    name,
+                    "--target",
+                    target,
+                    "--trial-cpu-used",
+                    "4",
+                ])
+                .unwrap();
+            let config = metric_options(&matches);
+            assert_eq!(config.kind, kind);
+            assert_eq!(config.target, target.parse::<f64>().unwrap());
+            assert_eq!(config.tolerance, tolerance);
+            assert_eq!(*matches.get_one::<u32>("trial_cpu_used").unwrap(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_handles_native_quality_and_distance_targets() {
+        for (kind, target) in [
+            (MetricKind::Vmaf, 70.0),
+            (MetricKind::Cvvdp, 7.0),
+            (MetricKind::Butteraugli, 3.0),
+        ] {
+            let config = cq_search::SearchConfig {
+                min: 10,
+                max: 50,
+                target: kind.search_score(target),
+                tolerance: 0.0,
+                max_new_evaluations: 20,
+            };
+            let result = cq_search::search(
+                &config,
+                &[],
+                move |cq| async move {
+                    let native = match kind {
+                        MetricKind::Vmaf => 100.0 - cq as f64,
+                        MetricKind::Cvvdp => 10.0 - cq as f64 / 10.0,
+                        MetricKind::Butteraugli => cq as f64 / 10.0,
+                    };
+                    kind.search_score(native)
+                },
+                |_| {},
+            )
+            .await;
+            assert_eq!(result.cq, 30, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn alternative_metrics_require_explicit_targets() {
+        for metric in ["cvvdp", "butteraugli", "unknown"] {
+            assert!(cli()
+                .try_get_matches_from([
+                    "sav1n",
+                    "-i",
+                    "input.mkv",
+                    "-v",
+                    "script.vpy",
+                    "--metric",
+                    metric,
+                ])
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_legacy_target_alias_and_custom_metric_settings() {
+        let matches = cli()
+            .try_get_matches_from([
+                "sav1n",
+                "-i",
+                "input.mkv",
+                "-v",
+                "script.vpy",
+                "--vmaf_target",
+                "93",
+                "--tolerance",
+                "0",
+                "--cvvdp-display",
+                "standard_4k",
+                "--cvvdp-device",
+                "cpu",
+            ])
+            .unwrap();
+        let config = metric_options(&matches);
+        assert_eq!(config.target, 93.0);
+        assert_eq!(config.tolerance, 0.0);
+        assert_eq!(config.display, "standard_4k");
+        assert_eq!(config.device, "cpu");
+    }
+
+    #[test]
+    fn rejects_nonfinite_scores_and_negative_tolerances() {
+        for (flag, value) in [
+            ("--target", "NaN"),
+            ("--target", "inf"),
+            ("--target", "-inf"),
+            ("--tolerance", "NaN"),
+            ("--tolerance", "-0.1"),
+            ("--cvvdp-device", "cuda"),
+        ] {
+            assert!(cli()
+                .try_get_matches_from(
+                    ["sav1n", "-i", "input.mkv", "-v", "script.vpy", flag, value,]
+                )
+                .is_err());
+        }
     }
 
     #[test]
@@ -1333,38 +1591,6 @@ mod tests {
                 "-f",
                 "yuv4mpegpipe",
                 "pipe:1",
-            ]
-        );
-    }
-
-    #[test]
-    fn pairs_vmaf_frames_by_index() {
-        let command = vmaf_command("ivf", "/tmp/0/000000.mkv");
-        let args: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_str().unwrap())
-            .collect();
-
-        assert_eq!(
-            args,
-            [
-                "-y",
-                "-f",
-                "ivf",
-                "-i",
-                "pipe:0",
-                "-threads",
-                "4",
-                "-i",
-                "/tmp/0/000000.mkv",
-                "-threads",
-                "1",
-                "-lavfi",
-                "[0:v]settb=AVTB,setpts=N[distorted];[1:v]settb=AVTB,setpts=N[reference];[distorted][reference]libvmaf=model='path=/usr/local/share/model/vmaf_v0.6.1.json'",
-                "-f",
-                "null",
-                "-",
             ]
         );
     }

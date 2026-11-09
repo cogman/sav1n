@@ -8,9 +8,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
     alien \
+    ca-certificates \
     clinfo \
     libass9 \
     libfftw3-bin \
+    libfreeimage3 \
+    libgomp1 \
     libpython3.13 \
     libvdpau1 \
     libva2 \
@@ -284,6 +287,53 @@ COPY --from=ttempsmooth /ttempsmooth/build/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/*.so /usr/local/lib/vapoursynth
 COPY --from=znedi3 /znedi3/nnedi3_weights.bin /usr/local/lib/vapoursynth
 
+# Official ColorVideoVDP package (the Python module is named pycvvdp).
+# Keep its dependencies separate from the system Python 3.13 VapourSynth stack.
+FROM runtime AS cvvdp
+ARG CVVDP_VERSION=0.5.7
+ARG TORCH_VERSION=2.15.0+cpu
+ARG TORCHVISION_VERSION=0.29.2+cpu
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y python3-venv
+RUN python3 -m venv /opt/cvvdp
+# Explicit CPU wheel pins also constrain the subsequent PyPI dependency resolution:
+# installing cvvdp must never replace these with the much larger CUDA wheels.
+# cvvdp also requires the unrelated ffmpeg distribution (sdist-only), which
+# overlaps ffmpeg-python's module; reinstall the bindings cvvdp actually uses.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/cvvdp/bin/pip install --only-binary=:all: \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" && \
+    /opt/cvvdp/bin/pip install --only-binary=:all: --no-binary=ffmpeg \
+        "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}" \
+        "cvvdp==${CVVDP_VERSION}" && \
+    /opt/cvvdp/bin/pip install --force-reinstall --no-deps ffmpeg-python==0.2.0 && \
+    /opt/cvvdp/bin/pip check && \
+    /opt/cvvdp/bin/cvvdp --help
+
+FROM build AS butteraugli
+ARG LIBJXL_VERSION=0.12.0
+RUN git clone --depth=1 --branch "v${LIBJXL_VERSION}" \
+        https://github.com/libjxl/libjxl.git /libjxl && \
+    git -C /libjxl submodule update --init --depth=1 \
+        third_party/brotli third_party/highway third_party/skcms \
+        third_party/libpng third_party/zlib
+# Build only the metric tool, with bundled PNG16 support and all libraries static.
+# Disable optional codecs rather than introducing hidden runtime dependencies.
+RUN cmake -S /libjxl -B /libjxl/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=OFF -DJPEGXL_STATIC=ON \
+        -DJPEGXL_ENABLE_DEVTOOLS=ON -DJPEGXL_ENABLE_TOOLS=ON \
+        -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF \
+        -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
+        -DJPEGXL_ENABLE_JNI=OFF -DJPEGXL_ENABLE_FUZZERS=OFF \
+        -DJPEGXL_ENABLE_OPENEXR=OFF -DJPEGXL_ENABLE_SJPEG=OFF \
+        -DJPEGXL_ENABLE_TCMALLOC=OFF -DJPEGXL_ENABLE_SKCMS=ON \
+        -DJPEGXL_BUNDLE_LIBPNG=ON -DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON && \
+    cmake --build /libjxl/build --target butteraugli_main --parallel 2 && \
+    install -Dm755 /libjxl/build/tools/butteraugli_main /out/butteraugli_main
+
 FROM build AS aom
 RUN git clone https://aomedia.googlesource.com/aom --depth=1 -b main /aom
 WORKDIR /aom_build
@@ -382,6 +432,7 @@ RUN git clone --branch 'release/8.1' https://github.com/FFmpeg/FFmpeg.git --dept
     --enable-libvmaf \
     --enable-libvpx \
     --enable-libx265 \
+    --enable-libzimg \
     --enable-vapoursynth \
     --enable-nonfree && \
     make -j`nproc` && \
@@ -444,13 +495,70 @@ COPY --from=removegrain /removegrain/build/libremovegrain.so /usr/local/lib/vapo
 COPY --from=vivtc /vivtc/build/*.so /usr/local/lib/vapoursynth/
 
 COPY --from=rustbuild /sav1n/target/release/sav1n .
+COPY --from=cvvdp /opt/cvvdp /opt/cvvdp
+COPY --from=butteraugli /out/butteraugli_main /usr/local/bin/butteraugli_main
 
-ENV PATH="/sav1n:/usr/local/bin:${PATH}"
+# Use the distro FreeImage library for imageio's PNG-FI (including RGB PNG16),
+# avoiding imageio's on-demand binary download into the runtime user's home.
+ENV IMAGEIO_FREEIMAGE_LIB=/usr/local/lib/libfreeimage.so.3
+RUN ln -s "$(dpkg -L libfreeimage3 | grep '/libfreeimage.so.3$')" "$IMAGEIO_FREEIMAGE_LIB" && \
+    printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /opt/cvvdp/bin/python -I -m pycvvdp.run_cvvdp "$@"' \
+    > /usr/local/bin/pycvvdp && \
+    chmod +x /usr/local/bin/pycvvdp && \
+    ln -s pycvvdp /usr/local/bin/cvvdp
+
+# Prefer the isolated CLI wrapper, not the venv's python3, for VapourSynth.
+ENV PATH="/sav1n:/usr/local/bin:${PATH}:/opt/cvvdp/bin"
 ENV PYTHONPATH=/usr/local/lib/python3.13/dist-packages
 ENV VAPOURSYNTH_EXTRA_PLUGIN_PATH=/usr/local/lib/vapoursynth
 ENV XDG_CONFIG_HOME=/etc/xdg
 RUN x265 --version && \
     ffmpeg -hide_banner -encoders | grep -q libx265
+RUN pycvvdp --help && cvvdp --help && ffmpeg -hide_banner -filters | grep -q zscale
+# butteraugli_main has no --help flag (usage exits 1). Exercise actual PNG16
+# decoding instead, and ensure the CVVDP venv uses CPU torch and ffmpeg-python.
+RUN /opt/cvvdp/bin/python -I - <<'PY'
+import struct
+import subprocess
+import tempfile
+import zlib
+from pathlib import Path
+
+import ffmpeg
+import imageio.v2 as imageio
+import numpy as np
+import pycvvdp
+import torch
+import torchvision
+
+assert torch.version.cuda is None, "CVVDP must use CPU-only PyTorch"
+assert callable(ffmpeg.probe) and callable(ffmpeg.input)
+subprocess.run(["ffprobe", "-version"], check=True, stdout=subprocess.DEVNULL)
+torch.set_num_threads(1)
+metric = pycvvdp.cvvdp(device=torch.device("cpu"), quiet=True)
+reference = np.full((32, 32, 3), 0.5, dtype=np.float32)
+quality, _ = metric.predict(reference, reference, dim_order="HWC")
+assert abs(quality.item() - 10.0) < 1e-5
+
+def chunk(kind, data):
+    return (struct.pack(">I", len(data)) + kind + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+with tempfile.TemporaryDirectory() as tmp:
+    image = Path(tmp) / "rgb16.png"
+    # A nontrivial RGB16 sample verifies the full 16 bits survive imageio loading.
+    row = b"\x00" + struct.pack(">HHH", 12345, 23456, 34567) * 32
+    image.write_bytes(b"\x89PNG\r\n\x1a\n"
+                      + chunk(b"IHDR", struct.pack(">IIBBBBB", 32, 32, 16, 2, 0, 0, 0))
+                      + chunk(b"IDAT", zlib.compress(row * 32)) + chunk(b"IEND", b""))
+    pixels = imageio.imread(image, format="PNG-FI")
+    assert pixels.dtype == np.uint16 and pixels[0, 0].tolist() == [12345, 23456, 34567]
+    result = subprocess.run(["butteraugli_main", str(image), str(image)],
+                            check=True, capture_output=True, text=True)
+    assert float(result.stdout.splitlines()[0]) == 0.0, result.stdout
+PY
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'exec python3 -m vapoursynth "$@"' \

@@ -10,7 +10,6 @@ edition = "2021"
 mimalloc = "0.1.52"
 tokio = { version = "1.54", features=["io-std", "fs", "io-util", "time", "process", "macros", "rt-multi-thread", "sync", "signal"] }
 clap = "4.6"
-regex = "1.13"
 serde_json = "1.0.154"
 glob = "0.3.4"
 

@@ -22,18 +22,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
   2. **Video preprocessing** – `vspipe` runs a VapourSynth script, producing Y4M frames and optional timecodes.
   3. **Scene detection** – First‑pass AOM (AV1) encoding writes keyframe statistics; these are consumed by a stats processor to decide scene boundaries.
   4. **Scene encoding** – Each scene is written to disk as a lossless FFV1 Matroska file, decoded back to Y4M on a pipe, and encoded using the VP9 (`Vp9Encoder`), AV1 (`Av1Encoder`), or x265 (`X265Encoder`) implementation behind the `Encoder` trait. VP9 and AV1 use a two‑pass flow (first‑pass for quality estimation, second‑pass for final output); x265 uses single‑pass CRF.
-  5. **VMAF quality search** – A Brent-style integer search adjusts the constant quality (CQ) value per scene to meet the target VMAF score.
+  5. **Perceptual quality search** – A metric-independent Brent-style integer search adjusts CQ/CRF per scene to meet a VMAF, CVVDP, or mean per-frame Butteraugli target. Reference-only metric preparation runs once per scene (`{scene}.metric`); trial encodes and metric artifacts live in isolated probe workspaces (`{scene}.probe-{cq}`); metric scores are reported in native units.
   6. **Muxing** – `mkvmerge` concatenates the per‑scene IVF files, audio track, and optional timestamps into the final MKV.
 - **Key modules**:
   - `src/encoder.rs` – Defines the `Encoder` trait and concrete implementations for VP9, AV1, and x265.
-  - `src/cq_search.rs` – Brent-style integer search for the CQ that meets the target VMAF score.
+  - `src/cq_search.rs` – Metric-independent Brent-style integer search; lower-is-better scores and targets are negated at the integration boundary.
+  - `src/metric.rs` – VMAF, CVVDP, and Butteraugli backends, input preparation, native score parsing, and validation.
   - `src/frame.rs`, `src/frame_buffer.rs` – Frame handling and buffering logic.
   - `src/video_header.rs` – Reads/writes Y4M headers.
   - `src/shutdown.rs` – Tracks child processes and temporary folders, and terminates them gracefully on `SIGINT`/`SIGTERM`.
   - `src/aom_firstpass.rs` – Parses AOM first‑pass logs for scene detection.
   - `src/vp9_encoder.rs` / `src/av1_encoder.rs` / `src/x265_encoder.rs` – Wrapper around external encoders (`vpxenc`, `aomenc`, `x265`).
 - **External dependencies**: The tool orchestrates several command‑line utilities (`ffprobe`, `ffmpeg`, `mkvmerge`, `aomenc`, `vpxenc`, `x265`, `vspipe`). These must be installed and available in `$PATH`.
-- **Configuration**: CLI flags control input files, VapourSynth script, number of parallel encoders, target VMAF, CPU usage for encoding, and codec selection.
+- **Configuration**: CLI flags control inputs, VapourSynth script, concurrency, metric (`--metric`), native target (`--target`), tolerance, trial/final encoding speeds, CVVDP display/device, and codec. VMAF defaults to 95; other metrics require an explicit target. Legacy VMAF flag names remain aliases.
 
 ## Notes for Claude Code
 - When running commands, prefer the standard Rust tooling (`cargo ...`).
