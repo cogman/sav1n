@@ -446,6 +446,44 @@ impl SceneFile {
 
 const FFV1_DECODE_THREADS: &str = "4";
 
+// These overrides are scoped to the test task, not the process environment.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PIPELINE_ENV: (PathBuf, String);
+}
+
+#[cfg(test)]
+fn configure_test_pipeline_command(command: &mut Command) {
+    let _ = TEST_PIPELINE_ENV.try_with(|(path, root)| {
+        command.env("PATH", path).env("MOCK_SCENARIO", root);
+    });
+}
+
+// Tokio task locals are not inherited by spawned tasks. Capture both command
+// environments before spawning and restore them while the child future runs.
+#[cfg(test)]
+fn inherit_test_command_env<F>(future: F) -> impl std::future::Future<Output = F::Output> + Send
+where
+    F: std::future::Future + Send,
+{
+    let pipeline = TEST_PIPELINE_ENV.try_with(Clone::clone).ok();
+    let metric = metric::TEST_METRIC_ENV.try_with(Clone::clone).ok();
+    async move {
+        let future = async move {
+            if let Some(metric) = metric {
+                metric::TEST_METRIC_ENV.scope(metric, future).await
+            } else {
+                future.await
+            }
+        };
+        if let Some(pipeline) = pipeline {
+            TEST_PIPELINE_ENV.scope(pipeline, future).await
+        } else {
+            future.await
+        }
+    }
+}
+
 fn ffv1_scene_command(path: &str) -> Command {
     let mut command = Command::new("ffmpeg");
     command
@@ -464,6 +502,8 @@ fn ffv1_scene_command(path: &str) -> Command {
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null());
+    #[cfg(test)]
+    configure_test_pipeline_command(&mut command);
     command
 }
 
@@ -484,6 +524,8 @@ fn ffv1_decoder_command(path: &str) -> Command {
         .arg("yuv4mpegpipe")
         .arg("pipe:1")
         .stdout(Stdio::piped());
+    #[cfg(test)]
+    configure_test_pipeline_command(&mut command);
     command
 }
 
@@ -531,7 +573,7 @@ async fn compress_scene(
     encoder: Arc<dyn Encoder + Send + Sync>,
 ) -> JoinHandle<()> {
     let mut permits = encoding_scenes.acquire_many_owned(2).await.unwrap();
-    tokio::spawn(async move {
+    let scene = async move {
         scene_file.wait().await;
         let first_pass = async {
             if let Some(mut first_pass) =
@@ -669,7 +711,10 @@ async fn compress_scene(
         drop(second);
         drop(permits);
         cleanup(scene_number, tmp_folder).await;
-    })
+    };
+    #[cfg(test)]
+    let scene = inherit_test_command_env(scene);
+    tokio::spawn(scene)
 }
 
 async fn first_pass(
@@ -1156,6 +1201,381 @@ struct FrameStats {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    mod mock_pipeline {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TestDir(PathBuf);
+
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn executable(root: &Path, name: &str, script: &str) {
+            let path = root.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Run in-process so coverage tools see the production paths, while
+        // command environments remain scoped to this task and its children.
+        #[tokio::test]
+        async fn scene_pipeline_with_mock_commands() {
+            let root = TestDir(
+                std::env::temp_dir().join(format!("sav1n mock pipeline {}", std::process::id())),
+            );
+            std::fs::create_dir(&root.0).unwrap();
+            executable(
+                &root.0,
+                "ffprobe",
+                r##"#!/bin/sh
+printf 'probe %s\n' "$*" >> "$MOCK_SCENARIO/calls"
+for last do :; done
+[ -f "$last" ] || exit 8
+[ ! -f "$MOCK_SCENARIO/fail-probe" ] || exit 9
+printf '%s\n' '{"streams":[{"width":64,"height":48,"nb_read_frames":"1","nb_read_packets":"1","avg_frame_rate":"24/1","pix_fmt":"yuv420p","color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"}]}'
+"##,
+            );
+            executable(
+                &root.0,
+                "ffmpeg",
+                r##"#!/bin/sh
+printf 'ffmpeg %s\n' "$*" >> "$MOCK_SCENARIO/calls"
+for last do :; done
+case " $* " in
+  *' -lavfi '*)
+    [ ! -f "$MOCK_SCENARIO/fail-vmaf" ] || exit 10
+    for arg do case "$arg" in *.probe-*/trial.ivf) trial=$arg;; esac; done
+    probe=${trial%/*}; cq=${probe##*.probe-}
+    printf 'VMAF score: %s\n' "$((100 - cq))" >&2
+    ;;
+  *' -f image2pipe '*) /bin/cat "$MOCK_SCENARIO/frame.png" ;;
+  *' -fps_mode passthrough '*)
+    [ ! -f "$MOCK_SCENARIO/fail-comparison" ] || exit 11
+    : > "$last"
+    ;;
+  *' -f matroska '*) /bin/cat > "$last" ;;
+  *)
+    printf 'mock y4m\n'
+    [ ! -f "$MOCK_SCENARIO/fail-decoder" ] || exit 12
+    ;;
+esac
+"##,
+            );
+            executable(
+                &root.0,
+                "mock-encoder",
+                r##"#!/bin/sh
+printf 'encoder %s %s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$MOCK_SCENARIO/calls"
+/bin/cat > /dev/null
+[ "$7" != fail ] || exit 13
+if [ "$1" = first ]; then printf 'pass log' > "$6"; else printf 'cq=%s' "$2" > "$5"; fi
+"##,
+            );
+            executable(
+                &root.0,
+                "cvvdp",
+                r##"#!/bin/sh
+printf 'cvvdp %s\n' "$*" >> "$MOCK_SCENARIO/calls"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --result ]; then shift; result=$1; fi
+  shift
+done
+printf 'test,reference,CVVDP\ntest,ref,8.25\n' > "$result"
+"##,
+            );
+            executable(
+                &root.0,
+                "butteraugli_main",
+                r##"#!/bin/sh
+printf 'butteraugli %s\n' "$*" >> "$MOCK_SCENARIO/calls"
+printf '1.25\n3-norm: 0.5\n'
+"##,
+            );
+
+            // A minimal RGB16 PNG stream; the mock scorer only reads the files.
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&64u32.to_be_bytes());
+            png.extend_from_slice(&48u32.to_be_bytes());
+            png.extend_from_slice(&[16, 2, 0, 0, 0]);
+            png.extend_from_slice(&[0; 4]);
+            png.extend_from_slice(&0u32.to_be_bytes());
+            png.extend_from_slice(b"IEND");
+            png.extend_from_slice(&[0; 4]);
+            std::fs::write(root.0.join("frame.png"), png).unwrap();
+
+            let environment = (root.0.clone(), root.0.to_str().unwrap().to_string());
+            TEST_PIPELINE_ENV
+                .scope(
+                    environment.clone(),
+                    metric::TEST_METRIC_ENV.scope(environment, exercise_pipeline(root.0.clone())),
+                )
+                .await;
+        }
+
+        struct MockEncoder {
+            first_pass: bool,
+            fail: bool,
+        }
+
+        impl MockEncoder {
+            fn command(&self, phase: &str, options: EncoderOptions<'_>) -> Command {
+                let mut command = Command::new("mock-encoder");
+                command.args([
+                    phase,
+                    &options.cq.to_string(),
+                    &options.cpu_used.to_string(),
+                    &options.threads.to_string(),
+                    options.output,
+                    options.log_file,
+                    if self.fail { "fail" } else { "ok" },
+                ]);
+                configure_test_pipeline_command(&mut command);
+                command
+            }
+        }
+
+        impl Encoder for MockEncoder {
+            fn first_pass(&self, options: EncoderOptions<'_>) -> Option<Command> {
+                self.first_pass.then(|| self.command("first", options))
+            }
+
+            fn second_pass(&self, options: EncoderOptions<'_>) -> Command {
+                self.command("second", options)
+            }
+
+            fn container_format(&self) -> &'static str {
+                "ivf"
+            }
+            fn max_cq(&self) -> u32 {
+                50
+            }
+        }
+
+        fn metric(kind: MetricKind) -> Arc<MetricConfig> {
+            Arc::new(MetricConfig {
+                kind,
+                target: 75.0,
+                tolerance: 0.0,
+                display: "standard_fhd".into(),
+                device: "cpu".into(),
+            })
+        }
+
+        fn panic_message(error: tokio::task::JoinError) -> String {
+            let panic = error.into_panic();
+            if let Some(message) = panic.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                panic.downcast_ref::<&str>().unwrap().to_string()
+            }
+        }
+
+        async fn exercise_pipeline(root: PathBuf) {
+            let dir = root.to_str().unwrap().to_string();
+            let encoder: Arc<dyn Encoder + Send + Sync> = Arc::new(MockEncoder {
+                first_pass: true,
+                fail: false,
+            });
+            let header = Arc::new(VideoHeader {
+                as_bytes: b"YUV4MPEG2 W64 H48 F24:1 C420\n".to_vec(),
+                ..VideoHeader::new()
+            });
+            let writer = create_scene_file(&dir, 1, header.clone()).await;
+            let writer = write_scene_frame(writer, Arc::new(Frame::new(8, 0))).await;
+            let permits = Arc::new(Semaphore::new(2));
+            let prior = Arc::new(Mutex::new(vec![10, 12, 14, 16, 18, 20, 22, 24, 26, 28]));
+            compress_scene(
+                1,
+                writer.close(),
+                permits.clone(),
+                prior.clone(),
+                metric(MetricKind::Vmaf),
+                2,
+                4,
+                dir.clone(),
+                encoder.clone(),
+            )
+            .await
+            .await
+            .unwrap();
+
+            assert_eq!(permits.available_permits(), 2);
+            assert_eq!(
+                *prior.lock().await,
+                [10, 12, 14, 16, 18, 20, 22, 24, 25, 26, 28]
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("000001.ivf")).unwrap(),
+                "cq=25"
+            );
+            for path in [
+                "000001.mkv",
+                "000001.log",
+                "000001.metric",
+                "000001.probe-12",
+                "000001.probe-26",
+            ] {
+                assert!(!root.join(path).exists(), "{path} was not cleaned up");
+            }
+            let log = std::fs::read_to_string(root.join("calls")).unwrap();
+            assert!(log.contains("encoder first 20 0 1 /dev/null"));
+            assert!(log.contains("encoder second 12 6 1 "));
+            assert!(log.contains("encoder second 26 6 1 "));
+            assert!(log.contains("encoder second 25 2 1 "));
+            assert!(log
+                .lines()
+                .any(|line| line.starts_with("encoder second ") && line.contains(" 4 2 ")));
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.starts_with("probe ")
+                        && line.contains("-count_frames")
+                        && line.contains("000001.mkv"))
+                    .count(),
+                1
+            );
+
+            // Reference preparation is shared; two probes have separate workspaces.
+            std::fs::write(root.join("000002.mkv"), "reference").unwrap();
+            let cvvdp = metric(MetricKind::Cvvdp);
+            let reference = Arc::new(prepare_reference(2, &dir, &cvvdp).await);
+            assert!(root.join("000002.metric/cvvdp-reference.mkv").exists());
+            let (a, b) = tokio::join!(
+                evaluate_trial(
+                    2,
+                    21,
+                    3,
+                    2,
+                    dir.clone(),
+                    encoder.clone(),
+                    cvvdp.clone(),
+                    reference.clone()
+                ),
+                evaluate_trial(
+                    2,
+                    22,
+                    3,
+                    2,
+                    dir.clone(),
+                    encoder.clone(),
+                    cvvdp.clone(),
+                    reference.clone()
+                ),
+            );
+            assert_eq!((a, b), (8.25, 8.25));
+            assert!(!root.join("000002.probe-21").exists());
+            assert!(!root.join("000002.probe-22").exists());
+            cleanup(2, dir.clone()).await;
+            assert!(!root.join("000002.metric").exists());
+            assert!(!root.join("000002.mkv").exists());
+
+            // Lower-is-better distances are negated when returned to CQ search.
+            std::fs::write(root.join("000003.mkv"), "reference").unwrap();
+            let butter = metric(MetricKind::Butteraugli);
+            let reference = Arc::new(prepare_reference(3, &dir, &butter).await);
+            let score =
+                evaluate_trial(3, 30, 3, 2, dir.clone(), encoder.clone(), butter, reference).await;
+            assert_eq!(score, -1.25);
+            assert!(!root.join("000003.probe-30").exists());
+            cleanup(3, dir.clone()).await;
+
+            // Preparation failure removes its partially created shared workspace.
+            std::fs::write(root.join("000004.mkv"), "reference").unwrap();
+            std::fs::write(root.join("fail-comparison"), "").unwrap();
+            let child_dir = dir.clone();
+            let error = tokio::spawn(inherit_test_command_env(async move {
+                prepare_reference(4, &child_dir, &metric(MetricKind::Cvvdp)).await
+            }))
+            .await
+            .unwrap_err();
+            let message = panic_message(error);
+            assert!(
+                message.contains("cvvdp reference preparation failed for scene 4"),
+                "{message}"
+            );
+            assert!(!root.join("000004.metric").exists());
+            std::fs::remove_file(root.join("fail-comparison")).unwrap();
+
+            // Trial failures identify the scene and CQ and still remove workspaces.
+            let vmaf = metric(MetricKind::Vmaf);
+            let reference = Arc::new(prepare_reference(4, &dir, &vmaf).await);
+            for (flag, failing_encoder, expected) in [
+                (None, true, "trial encoder failed"),
+                (
+                    Some("fail-decoder"),
+                    false,
+                    "trial reference decoder failed",
+                ),
+                (Some("fail-vmaf"), false, "FFmpeg libvmaf"),
+            ] {
+                if let Some(flag) = flag {
+                    std::fs::write(root.join(flag), "").unwrap();
+                }
+                let child_dir = dir.clone();
+                let child_reference = reference.clone();
+                let child_metric = vmaf.clone();
+                let child_encoder: Arc<dyn Encoder + Send + Sync> = Arc::new(MockEncoder {
+                    first_pass: false,
+                    fail: failing_encoder,
+                });
+                let error = tokio::spawn(inherit_test_command_env(async move {
+                    evaluate_trial(
+                        4,
+                        31,
+                        3,
+                        2,
+                        child_dir,
+                        child_encoder,
+                        child_metric,
+                        child_reference,
+                    )
+                    .await
+                }))
+                .await
+                .unwrap_err();
+                let message = panic_message(error);
+                assert!(
+                    message.contains("vmaf evaluation failed for scene 4 CQ 31"),
+                    "{message}"
+                );
+                assert!(message.contains(expected), "{message}");
+                assert!(!root.join("000004.probe-31").exists());
+                if let Some(flag) = flag {
+                    std::fs::remove_file(root.join(flag)).unwrap();
+                }
+            }
+            cleanup(4, dir.clone()).await;
+
+            // A failed scene must release both permits rather than block later scenes.
+            std::fs::write(root.join("fail-vmaf"), "").unwrap();
+            let writer = create_scene_file(&dir, 5, header).await;
+            let writer = write_scene_frame(writer, Arc::new(Frame::new(8, 0))).await;
+            let error = compress_scene(
+                5,
+                writer.close(),
+                permits.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                metric(MetricKind::Vmaf),
+                2,
+                4,
+                dir.clone(),
+                encoder,
+            )
+            .await
+            .await
+            .unwrap_err();
+            assert!(panic_message(error).contains("vmaf evaluation failed for scene 5"));
+            assert_eq!(permits.available_permits(), 2);
+            std::fs::remove_file(root.join("fail-vmaf")).unwrap();
+            cleanup(5, dir).await;
+        }
+    }
+
     #[test]
     fn cli_definition_is_valid() {
         cli().debug_assert();
@@ -1330,6 +1750,97 @@ mod tests {
                     ["sav1n", "-i", "input.mkv", "-v", "script.vpy", flag, value,]
                 )
                 .is_err());
+        }
+    }
+
+    #[test]
+    fn metric_defaults_and_overrides_reach_the_configuration() {
+        let defaults = cli()
+            .try_get_matches_from(["sav1n", "-i", "input.mkv", "-v", "script.vpy"])
+            .unwrap();
+        let config = metric_options(&defaults);
+        assert_eq!(config.kind, MetricKind::Vmaf);
+        assert_eq!(config.target, 95.0);
+        assert_eq!(config.tolerance, 0.5);
+        assert_eq!(config.display, "standard_fhd");
+        assert_eq!(config.device, "cpu");
+
+        for metric in ["cvvdp", "butteraugli"] {
+            let matches = cli()
+                .try_get_matches_from([
+                    "sav1n",
+                    "-i",
+                    "input.mkv",
+                    "-v",
+                    "script.vpy",
+                    "--metric",
+                    metric,
+                    "--target",
+                    "-1.25",
+                    "--tolerance",
+                    "0.125",
+                    "--cvvdp-display",
+                    "hdr_pq",
+                    "--cvvdp-device",
+                    "2",
+                ])
+                .unwrap();
+            let config = metric_options(&matches);
+            assert_eq!(config.target, -1.25);
+            assert_eq!(config.tolerance, 0.125);
+            assert_eq!(config.display, "hdr_pq");
+            assert_eq!(config.device, "2");
+        }
+    }
+
+    #[test]
+    fn cli_reports_missing_required_arguments_and_metric_targets() {
+        use clap::error::ErrorKind;
+
+        for args in [
+            vec!["sav1n"],
+            vec!["sav1n", "-i", "input.mkv"],
+            vec!["sav1n", "-v", "script.vpy"],
+            vec![
+                "sav1n",
+                "-i",
+                "input.mkv",
+                "-v",
+                "script.vpy",
+                "--metric",
+                "cvvdp",
+            ],
+            vec![
+                "sav1n",
+                "-i",
+                "input.mkv",
+                "-v",
+                "script.vpy",
+                "--metric",
+                "butteraugli",
+            ],
+        ] {
+            assert_eq!(
+                cli().try_get_matches_from(args).unwrap_err().kind(),
+                ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_metric_values_and_devices() {
+        for (flag, value) in [
+            ("--metric", "unknown"),
+            ("--target", "not-a-number"),
+            ("--target", "1e999"),
+            ("--tolerance", "inf"),
+            ("--tolerance", "not-a-number"),
+            ("--cvvdp-device", "-1"),
+            ("--cvvdp-device", "1.5"),
+            ("--cvvdp-device", "4294967296"),
+        ] {
+            let args = ["sav1n", "-i", "input.mkv", "-v", "script.vpy", flag, value];
+            assert!(cli().try_get_matches_from(args).is_err(), "{flag} {value}");
         }
     }
 

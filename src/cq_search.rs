@@ -610,6 +610,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_unique_in_range_seeds_and_new_probes_in_order() {
+        let cfg = config(10, 20, 85.0);
+        let initial = [
+            Sample {
+                cq: 9,
+                score: f64::NAN,
+            },
+            Sample {
+                cq: 12,
+                score: 88.0,
+            },
+            Sample {
+                cq: 12,
+                score: f64::NAN,
+            },
+            Sample {
+                cq: 20,
+                score: 80.0,
+            },
+        ];
+        let mut reported = Vec::new();
+        // The evaluator is Fn, so record calls through interior mutability.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = search(
+            &cfg,
+            &initial,
+            |cq| {
+                calls.borrow_mut().push(cq);
+                async move { 100.0 - cq as f64 }
+            },
+            |sample| reported.push(*sample),
+        )
+        .await;
+        let evaluated = calls.into_inner();
+
+        assert_eq!(outcome.cq, 15);
+        assert!(outcome.converged);
+        assert_eq!(reported, outcome.samples);
+        assert_eq!(&reported[..2], &[initial[1], initial[3]]);
+        assert_eq!(
+            evaluated,
+            reported[2..]
+                .iter()
+                .map(|sample| sample.cq)
+                .collect::<Vec<_>>()
+        );
+        let mut unique = evaluated.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), evaluated.len());
+        assert!(evaluated.iter().all(|cq| *cq != 12 && *cq != 20));
+    }
+
+    #[tokio::test]
+    async fn seeded_search_budget_returns_best_known_acceptable_without_extra_calls() {
+        let initial = [
+            Sample {
+                cq: 10,
+                score: 100.0,
+            },
+            Sample {
+                cq: 20,
+                score: 90.0,
+            },
+            Sample {
+                cq: 40,
+                score: 70.0,
+            },
+        ];
+        let mut cfg = config(10, 50, 85.0);
+        cfg.max_new_evaluations = 0;
+        let (outcome, calls) = run(&cfg, &initial, |cq| 110.0 - cq as f64).await;
+        assert_eq!(calls, 0);
+        assert_eq!(outcome.cq, 20);
+        assert_eq!(outcome.samples, initial);
+        assert!(!outcome.converged);
+
+        cfg.max_new_evaluations = 1;
+        let (outcome, calls) = run(&cfg, &initial, |cq| 110.0 - cq as f64).await;
+        assert_eq!(calls, 1);
+        assert_eq!(outcome.samples.len(), initial.len() + 1);
+        assert!(outcome
+            .samples
+            .iter()
+            .any(|sample| sample.cq == outcome.cq && sample.score >= cfg.target));
+    }
+
+    #[tokio::test]
+    async fn boundary_probes_consume_budget_and_prove_edge_cases() {
+        for (score, boundary, expected) in [(80.0, 10, 10), (100.0, 50, 50)] {
+            let initial = [Sample { cq: 30, score }];
+            let mut cfg = config(10, 50, 90.0);
+            cfg.max_new_evaluations = 0;
+            let (limited, calls) = run(&cfg, &initial, |_| score).await;
+            assert_eq!(calls, 0);
+            assert!(!limited.converged);
+
+            cfg.max_new_evaluations = 1;
+            let (outcome, calls) = run(&cfg, &initial, |_| score).await;
+            assert_eq!(calls, 1);
+            assert_eq!(
+                outcome.samples[1],
+                Sample {
+                    cq: boundary,
+                    score
+                }
+            );
+            assert_eq!(outcome.cq, expected);
+            assert!(outcome.converged);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_tolerance_resolves_exact_target_plateau() {
+        let cfg = config(0, 20, 90.0);
+        let score = |cq| {
+            if cq < 5 {
+                95.0
+            } else if cq <= 15 {
+                90.0
+            } else {
+                85.0
+            }
+        };
+        let initial = [
+            Sample { cq: 5, score: 90.0 },
+            Sample {
+                cq: 20,
+                score: 85.0,
+            },
+        ];
+        let (outcome, _) = run(&cfg, &initial, score).await;
+        assert_eq!(outcome.cq, 15);
+        assert!(outcome.converged);
+    }
+
+    #[tokio::test]
+    async fn tolerance_does_not_accept_scores_below_target() {
+        let mut cfg = config(10, 20, 90.0);
+        cfg.tolerance = 0.5;
+        let initial = [Sample {
+            cq: 15,
+            score: 89.9,
+        }];
+        let (outcome, calls) = run(&cfg, &initial, |_| 89.9).await;
+        assert_eq!(calls, 1);
+        assert_eq!(outcome.cq, 10);
+        assert!(outcome.converged);
+        assert_eq!(outcome.samples[1].cq, 10);
+    }
+
+    #[tokio::test]
+    async fn non_monotone_seed_bracket_falls_back_to_best_acceptable() {
+        let cfg = config(10, 50, 90.0);
+        let initial = [
+            Sample {
+                cq: 20,
+                score: 80.0,
+            },
+            Sample {
+                cq: 40,
+                score: 95.0,
+            },
+        ];
+        let (outcome, calls) = run(&cfg, &initial, |_| 90.0).await;
+        assert_eq!(calls, 0);
+        assert_eq!(outcome.cq, 40);
+        assert!(!outcome.converged);
+    }
+
+    #[tokio::test]
+    async fn supports_ranges_near_u32_max() {
+        let cfg = config(u32::MAX - 20, u32::MAX, 0.0);
+        let threshold = u32::MAX - 7;
+        let (outcome, _) = run(&cfg, &[], |cq| (threshold as i64 - cq as i64) as f64).await;
+        assert_eq!(outcome.cq, threshold);
+        assert!(outcome.converged);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "search range is empty")]
+    async fn rejects_reversed_domain() {
+        search(&config(20, 10, 90.0), &[], |_| async { 90.0 }, |_| {}).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "target must be finite")]
+    async fn rejects_nonfinite_target() {
+        search(
+            &config(10, 20, f64::INFINITY),
+            &[],
+            |_| async { 90.0 },
+            |_| {},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "tolerance must be finite and nonnegative")]
+    async fn rejects_nonfinite_tolerance() {
+        let mut cfg = config(10, 20, 90.0);
+        cfg.tolerance = f64::NAN;
+        search(&cfg, &[], |_| async { 90.0 }, |_| {}).await;
+    }
+
+    #[tokio::test]
     async fn agrees_with_brute_force_across_monotone_curves() {
         let cfg = config(10, 60, 0.0);
 

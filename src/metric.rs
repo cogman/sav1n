@@ -256,7 +256,18 @@ impl MetricConfig {
     }
 }
 
+// Integration tests scope mock executables to their own async task without
+// changing the process-wide environment used by other tests.
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_METRIC_ENV: (std::path::PathBuf, String);
+}
+
 fn captured(command: &mut Command) -> &mut Command {
+    #[cfg(test)]
+    let _ = TEST_METRIC_ENV.try_with(|(path, scenario)| {
+        command.env("PATH", path).env("MOCK_SCENARIO", scenario);
+    });
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1171,11 +1182,651 @@ mod tests {
         assert!(!a.iter().any(|a| a.contains("fps=")));
     }
 
+    #[test]
+    fn config_validation_and_input_paths() {
+        for kind in [MetricKind::Vmaf, MetricKind::Cvvdp, MetricKind::Butteraugli] {
+            let c = config(kind);
+            assert!(c.validate().is_ok());
+            for (target, tolerance) in [
+                (f64::NAN, 0.1),
+                (f64::INFINITY, 0.1),
+                (1.0, f64::NEG_INFINITY),
+                (1.0, f64::NAN),
+                (1.0, -0.1),
+            ] {
+                let mut invalid = c.clone();
+                invalid.target = target;
+                invalid.tolerance = tolerance;
+                assert!(invalid
+                    .validate()
+                    .unwrap_err()
+                    .contains("finite and nonnegative"));
+            }
+            let mut zero = c.clone();
+            zero.tolerance = 0.0;
+            assert!(zero.validate().is_ok());
+        }
+        let mut c = config(MetricKind::Cvvdp);
+        c.display.clear();
+        assert!(c.validate().unwrap_err().contains("display and device"));
+        c.display = "standard_fhd".into();
+        c.device.clear();
+        assert!(c.validate().unwrap_err().contains("display and device"));
+        c.device = "-1".into();
+        assert!(c.validate().unwrap_err().contains("invalid CVVDP device"));
+        c.device = "00012".into();
+        assert!(c.validate().is_ok());
+        assert_eq!(cvvdp_device(&c.device).unwrap(), "cuda:12");
+        assert!(cvvdp_device("4294967296")
+            .unwrap_err()
+            .contains("too large"));
+
+        assert_eq!(
+            utf8_path(Path::new("work dir/test.mkv")).unwrap(),
+            "work dir/test.mkv"
+        );
+        assert!(cvvdp_path("comma,in path.mkv").is_ok());
+        for path in ["one\ntwo", "one\rtwo"] {
+            assert!(cvvdp_path(path).unwrap_err().contains("newlines"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_work_path_is_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"work/\xff"));
+        assert!(utf8_path(path).unwrap_err().contains("must be UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn invalid_config_fails_before_reference_probe() {
+        let mut c = config(MetricKind::Vmaf);
+        c.target = f64::NAN;
+        let error = c
+            .prepare_reference("does-not-exist", Path::new("unused"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("metric target must be finite"));
+        let prepared = PreparedReference {
+            path: "unused".into(),
+            info: info(),
+            cvvdp: None,
+            color: None,
+        };
+        let error = c
+            .evaluate(&prepared, "does-not-exist", Path::new("unused"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("metric target must be finite"));
+    }
+
+    #[test]
+    fn probe_parses_fallback_rates_and_reports_invalid_fields() {
+        let data = br#"{"streams":[{"width":"64","height":48,"nb_read_packets":3,"avg_frame_rate":"0/0","r_frame_rate":"24000/1001"}]}"#;
+        let video = parse_probe(data, Count::Packets).unwrap();
+        assert_eq!((video.width, video.height, video.frames), (64, 48, 3));
+        assert_eq!(video.fps, 24000.0 / 1001.0);
+        assert_eq!(video.pixel_format, "unknown");
+        assert_eq!(video.primaries, "unknown");
+        assert_eq!(video.transfer, "unknown");
+        assert_eq!(video.matrix, "unknown");
+        assert_eq!(video.range, "unknown");
+
+        for (json, message) in [
+            ("not json", "ffprobe JSON"),
+            (r#"{"streams":{}}"#, "no streams array"),
+            (r#"{"streams":[{},{}]}"#, "exactly one"),
+            (
+                r#"{"streams":[{"width":0,"height":48,"nb_read_frames":3,"avg_frame_rate":"24/1"}]}"#,
+                "missing/zero width",
+            ),
+            (
+                r#"{"streams":[{"width":64,"height":"0","nb_read_frames":3,"avg_frame_rate":"24/1"}]}"#,
+                "missing/zero height",
+            ),
+            (
+                r#"{"streams":[{"width":64,"height":48,"nb_read_frames":"N/A","avg_frame_rate":"24/1"}]}"#,
+                "missing/zero nb_read_frames",
+            ),
+            (
+                r#"{"streams":[{"width":64,"height":48,"nb_read_frames":3,"avg_frame_rate":"24/0","r_frame_rate":"-1/1"}]}"#,
+                "missing valid video frame rate",
+            ),
+            (
+                r#"{"streams":[{"width":64,"height":48,"nb_read_frames":3,"avg_frame_rate":"bad","r_frame_rate":"0/1"}]}"#,
+                "missing valid video frame rate",
+            ),
+        ] {
+            let error = parse_probe(json.as_bytes(), Count::Decoded).unwrap_err();
+            assert!(error.contains(message), "{json}: {error}");
+        }
+    }
+
+    #[test]
+    fn sdr_defaults_inheritance_and_invalid_tags() {
+        let mut video = info();
+        video.primaries = "unspecified".into();
+        video.transfer = "reserved".into();
+        video.matrix = "unknown".into();
+        video.range.clear();
+        let yuv = SdrColor::from_info(&video, None).unwrap();
+        assert_eq!(
+            (&*yuv.transfer, &*yuv.matrix, &*yuv.range),
+            ("bt709", "bt709", "tv")
+        );
+        for pixel_format in ["rgb24", "bgr24", "gbrp"] {
+            video.pixel_format = pixel_format.into();
+            let rgb = SdrColor::from_info(&video, None).unwrap();
+            assert_eq!(
+                (&*rgb.transfer, &*rgb.matrix, &*rgb.range),
+                ("iec61966-2-1", "gbr", "pc")
+            );
+            assert!(rgb.filter().contains("tin=iec61966-2-1:min=gbr:rin=full"));
+            let inherited = SdrColor::from_info(&video, Some(&yuv)).unwrap();
+            assert_eq!(
+                (&*inherited.transfer, &*inherited.matrix, &*inherited.range),
+                ("bt709", "gbr", "pc")
+            );
+        }
+        let rgb = SdrColor::from_info(&video, None).unwrap();
+        video.pixel_format = "yuv420p".into();
+        let inherited = SdrColor::from_info(&video, Some(&rgb)).unwrap();
+        assert_eq!(
+            (&*inherited.transfer, &*inherited.matrix, &*inherited.range),
+            ("iec61966-2-1", "bt709", "pc")
+        );
+        video.matrix = "bt2020nc".into();
+        assert!(SdrColor::from_info(&video, None)
+            .unwrap_err()
+            .contains("matrix=bt2020nc"));
+        video.matrix = "bt709".into();
+        video.range = "invalid".into();
+        assert!(SdrColor::from_info(&video, None)
+            .unwrap_err()
+            .contains("range=invalid"));
+    }
+
+    #[test]
+    fn comparison_command_inherits_only_missing_color_tags() {
+        let mut trial = info();
+        trial.primaries = "unknown".into();
+        trial.transfer = "unspecified".into();
+        trial.matrix = "bt2020nc".into();
+        trial.range = "reserved".into();
+        let mut reference = info();
+        reference.transfer = "unknown".into();
+        let a = args(&comparison_command(
+            "input",
+            Path::new("out.mkv"),
+            &trial,
+            &reference,
+        ));
+        assert!(a.windows(2).any(|p| p == ["-color_primaries", "bt709"]));
+        assert!(!a.iter().any(|arg| arg == "-color_trc"));
+        assert!(a.windows(2).any(|p| p == ["-colorspace", "bt2020nc"]));
+        assert!(a.windows(2).any(|p| p == ["-color_range", "tv"]));
+        let filter = &a[a.iter().position(|arg| arg == "-vf").unwrap() + 1];
+        assert!(filter.contains("setparams=color_primaries=bt709:colorspace=bt2020nc:range=tv"));
+        for tag in [
+            &mut trial.primaries,
+            &mut trial.transfer,
+            &mut trial.matrix,
+            &mut trial.range,
+            &mut reference.primaries,
+            &mut reference.transfer,
+            &mut reference.matrix,
+            &mut reference.range,
+        ] {
+            *tag = "unknown".into();
+        }
+        let a = args(&comparison_command(
+            "input",
+            Path::new("out.mkv"),
+            &trial,
+            &reference,
+        ));
+        let filter = &a[a.iter().position(|arg| arg == "-vf").unwrap() + 1];
+        assert!(!filter.contains("setparams"));
+        assert!(!a.iter().any(|arg| arg == "-color_range"));
+    }
+
+    #[test]
+    fn csv_and_diagnostic_edge_cases() {
+        assert_eq!(
+            parse_cvvdp_csv("\n test, reference, CvVdP \n\n a,b, 0 \n\n").unwrap(),
+            0.0
+        );
+        assert!(parse_cvvdp_csv("test,reference,cvvdp\nno-score")
+            .unwrap_err()
+            .contains("no score column"));
+        assert_eq!(parse_butteraugli("0\n3-norm: 2").unwrap(), 0.0);
+        let bytes = [vec![b'x'; 100], vec![b'y'; 8192]].concat();
+        assert_eq!(tail(&bytes), "y".repeat(8192));
+        assert_eq!(tail(b"  diagnostic \n"), "diagnostic");
+        assert_eq!(tail(b"\xff"), "\u{fffd}");
+    }
+
+    #[tokio::test]
+    async fn png_stream_reports_chunk_errors_and_dimension_overflow() {
+        let png = png_fixture(16);
+        let mut missing_ihdr = png.clone();
+        missing_ihdr[12..16].copy_from_slice(b"IDAT");
+        let mut wrong_color = png.clone();
+        wrong_color[25] = 6;
+        let mut bad_iend = png.clone();
+        bad_iend[33..37].copy_from_slice(&1u32.to_be_bytes());
+        bad_iend.push(0);
+        for (bytes, message) in [
+            (&png[..10], "truncated PNG chunk"),
+            (&png[..20], "truncated PNG chunk payload"),
+            (missing_ihdr.as_slice(), "missing IHDR"),
+            (wrong_color.as_slice(), "color_type=6"),
+            (bad_iend.as_slice(), "invalid PNG IEND length"),
+        ] {
+            let error = read_png(&mut &bytes[..], &info()).await.unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        let mut huge = info();
+        huge.width = u64::MAX;
+        assert!(read_png(&mut png.as_slice(), &huge)
+            .await
+            .unwrap_err()
+            .contains("overflow"));
+        let mut reference = png.as_slice();
+        let mut distorted = b"bad".as_slice();
+        assert!(read_pair(&mut reference, &mut distorted, &info())
+            .await
+            .unwrap_err()
+            .contains("truncated PNG signature"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_success_captures_stdout_and_stderr() {
+        let mut command = Command::new("sh");
+        captured(&mut command).args(["-c", "printf 'score'; printf ' warning ' >&2"]);
+        let output = run(command, "test metric").await.unwrap();
+        assert_eq!(output.stdout, b"score");
+        assert_eq!(diagnostics(&output), "stderr: warning; stdout: score");
+    }
+
+    // Each scenario scopes its mock environment to this task. No process-wide
+    // environment is changed, so these tests can run alongside real subprocesses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mock_backends_cover_preparation_and_evaluation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("sav1n-metric-mocks-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let install = |name: &str, script: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        install(
+            "ffprobe",
+            r##"#!/bin/sh
+for arg do last=$arg; done
+case "$MOCK_SCENARIO" in
+  probe_failure) printf 'probe failed' >&2; exit 3 ;;
+  probe_stderr) printf 'decode warning' >&2; exit 0 ;;
+  probe_bad_json) printf '{'; exit 0 ;;
+esac
+width=64 height=48 frames=3 rate=24/1 primaries=bt709
+case "$MOCK_SCENARIO" in
+  smoke_vmaf|smoke_cvvdp|smoke_butteraugli)
+    height=64; frames=8; rate=24000/1001
+    case "$last" in *short.mkv) frames=7 ;; esac ;;
+  smoke_retime) rate=24000/1001 ;;
+esac
+case "$MOCK_SCENARIO:$last" in
+  dimension_mismatch:*trial.mkv) width=32 ;;
+  frame_mismatch:*trial.mkv) frames=2 ;;
+  retime_ref_bad_frames:*cvvdp-reference.mkv) frames=2 ;;
+  retime_trial_bad_frames:*cvvdp-distorted.mkv) frames=2 ;;
+  retimed_fps_mismatch:*cvvdp-distorted.mkv) rate=25/1 ;;
+  prepare_color_error:*) primaries=bt2020 ;;
+  butter_color_invalid:*trial.mkv) primaries=bt2020 ;;
+esac
+printf '{"streams":[{"width":%s,"height":%s,"nb_read_frames":"%s","nb_read_packets":"%s","avg_frame_rate":"%s","pix_fmt":"yuv420p","color_primaries":"%s","color_transfer":"bt709","color_space":"bt709","color_range":"tv"}]}' "$width" "$height" "$frames" "$frames" "$rate" "$primaries"
+"##,
+        );
+        let encode_png = |png: &[u8]| png.iter().map(|b| format!("\\{b:03o}")).collect::<String>();
+        let png = png_fixture(16);
+        let mut square_png = png.clone();
+        square_png[20..24].copy_from_slice(&64u32.to_be_bytes());
+        let ffmpeg = r##"#!/bin/sh
+png=0 md5=0 prev= input= first_input= last=
+for arg do
+  if [ "$prev" = -i ]; then
+    input=$arg
+    if [ -z "$first_input" ]; then first_input=$arg; fi
+  fi
+  if [ "$arg" = image2pipe ]; then png=1; fi
+  if [ "$arg" = framemd5 ]; then md5=1; fi
+  prev=$arg; last=$arg
+done
+if [ "$png" = 1 ]; then
+  count=3 square=0
+  case "$MOCK_SCENARIO" in
+    butter_too_many) count=4 ;;
+    butter_too_few) count=2 ;;
+    butter_stream_mismatch) case "$input" in *trial.mkv) count=2 ;; esac ;;
+    butter_stream_invalid) printf 'bad'; exit 0 ;;
+    smoke_butteraugli) count=8; square=1 ;;
+  esac
+  while [ "$count" -gt 0 ]; do
+    if [ "$square" = 1 ]; then printf 'SQUARE_PNG_BYTES'; else printf 'PNG_BYTES'; fi
+    count=$((count - 1))
+  done
+  if [ "$MOCK_SCENARIO" = butter_decoder_failure ]; then
+    printf 'decoder broke' >&2; exit 4
+  fi
+  exit 0
+fi
+case "$MOCK_SCENARIO:$last" in
+  retime_ref_fail:*cvvdp-reference.mkv|retime_trial_fail:*cvvdp-distorted.mkv)
+    printf 'retime failed' >&2; exit 5 ;;
+  vmaf_failure:-) printf 'vmaf failed' >&2; exit 6 ;;
+  vmaf_invalid:-) printf 'VMAF score: NaN\n' >&2; exit 0 ;;
+esac
+if [ "$md5" = 1 ]; then
+  printf '# frame hashes\n0,0,0,1,4608,hash1\n0,1,1,1,4608,hash2\n0,2,2,1,4608,hash3\n'
+elif [ "$last" = - ]; then
+  score=94.5
+  case "$first_input" in *degraded.mkv) score=50 ;; esac
+  printf '[libvmaf] VMAF score: %s\n' "$score" >&2
+else
+  : > "$last"
+fi
+"##
+        .replace("SQUARE_PNG_BYTES", &encode_png(&square_png))
+        .replace("PNG_BYTES", &encode_png(&png));
+        install("ffmpeg", &ffmpeg);
+        install(
+            "cvvdp",
+            r##"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --result) result=$2; shift 2 ;;
+    --device) device=$2; shift 2 ;;
+    --fps) fps=$2; shift 2 ;;
+    --display) display=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$MOCK_SCENARIO:$fps:$display" in
+  smoke_cvvdp:23.976*:standard_fhd|*:24:standard_fhd) ;;
+  *) printf 'wrong CVVDP arguments' >&2; exit 8 ;;
+esac
+case "$MOCK_SCENARIO" in
+  cvvdp_failure) printf 'cvvdp failed' >&2; exit 7 ;;
+  cvvdp_gpu_fallback)
+    if [ "$device" != cuda:2 ]; then printf 'wrong GPU device' >&2; exit 8; fi
+    printf 'reverting to CPU' >&2; exit 0 ;;
+  cvvdp_missing_result) printf 'no result' >&2; exit 0 ;;
+  cvvdp_bad_result) printf 'test,reference,cvvdp\na,b,NaN\n' > "$result"; exit 0 ;;
+esac
+if [ "$device" != cpu ]; then printf 'wrong CPU device' >&2; exit 8; fi
+score=8.75
+case "$result" in */degraded/*) score=5 ;; esac
+printf 'test,reference,cvvdp\na,b,%s\n' "$score" > "$result"
+"##,
+        );
+        install(
+            "butteraugli_main",
+            r##"#!/bin/sh
+if [ "$3" != --colorspace ] || [ "$4" != RGB_D65_SRG_Rel_SRG ]; then
+  printf 'wrong colorspace' >&2; exit 8
+fi
+case "$MOCK_SCENARIO" in
+  butter_failed) printf 'butter failed' >&2; exit 9 ;;
+  butter_score_error) printf 'NaN\n'; exit 0 ;;
+  butter_success)
+    counter="${0%/*}/../butter-frame-count"
+    count=0
+    if [ -f "$counter" ]; then read -r count < "$counter"; fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$counter"
+    printf '%s\n3-norm: 0.5\n' "$count"
+    exit 0 ;;
+esac
+score=1.25
+case "$1" in */degraded/*) score=3 ;; esac
+printf '%s\n3-norm: 0.5\n' "$score"
+"##,
+        );
+        let scenarios = [
+            "probe_failure",
+            "probe_stderr",
+            "probe_bad_json",
+            "reference_newline",
+            "prepare_dir_error",
+            "prepare_color_error",
+            "retime_ref_fail",
+            "retime_ref_bad_frames",
+            "prepare_non_utf8",
+            "vmaf_success",
+            "vmaf_failure",
+            "vmaf_invalid",
+            "dimension_mismatch",
+            "frame_mismatch",
+            "evaluate_workdir_error",
+            "unprepared_cvvdp",
+            "unprepared_butter",
+            "trial_newline",
+            "stale_result_remove_error",
+            "retime_trial_fail",
+            "retime_trial_bad_frames",
+            "retimed_fps_mismatch",
+            "cvvdp_trial_non_utf8",
+            "cvvdp_success",
+            "cvvdp_failure",
+            "cvvdp_gpu_fallback",
+            "cvvdp_missing_result",
+            "cvvdp_bad_result",
+            "butter_success",
+            "butter_color_invalid",
+            "butter_failed",
+            "butter_score_error",
+            "butter_too_many",
+            "butter_too_few",
+            "butter_stream_mismatch",
+            "butter_stream_invalid",
+            "butter_decoder_failure",
+            "butter_write_error",
+        ];
+        for scenario in scenarios {
+            let work = root.join(scenario);
+            std::fs::create_dir(&work).unwrap();
+            TEST_METRIC_ENV
+                .scope((bin.clone(), scenario.into()), async {
+                    mock_metric_scenario(scenario, &work).await;
+                })
+                .await;
+        }
+        // Exercise the smoke-test orchestration with fakes; these runs do not
+        // validate metric quality or FFmpeg's frame preservation. The ignored
+        // real-tool tests below perform those checks separately.
+        for kind in [MetricKind::Vmaf, MetricKind::Cvvdp, MetricKind::Butteraugli] {
+            TEST_METRIC_ENV
+                .scope((bin.clone(), format!("smoke_{}", kind.name())), async {
+                    real_metric_smoke(kind).await;
+                })
+                .await;
+        }
+        TEST_METRIC_ENV
+            .scope((bin, "smoke_retime".into()), async {
+                lossless_retime_smoke().await;
+            })
+            .await;
+    }
+
+    #[cfg(unix)]
+    async fn mock_metric_scenario(scenario: &str, work: &Path) {
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = || work.join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        let mut c = config(
+            if scenario.starts_with("butter_") || scenario == "prepare_color_error" {
+                MetricKind::Butteraugli
+            } else if scenario.starts_with("cvvdp_")
+                || scenario.starts_with("retime")
+                || matches!(
+                    scenario,
+                    "reference_newline"
+                        | "prepare_dir_error"
+                        | "prepare_non_utf8"
+                        | "trial_newline"
+                        | "stale_result_remove_error"
+                )
+            {
+                MetricKind::Cvvdp
+            } else {
+                MetricKind::Vmaf
+            },
+        );
+        if scenario == "cvvdp_gpu_fallback" {
+            c.device = "2".into();
+        }
+        let ref_work = if scenario == "prepare_non_utf8" {
+            non_utf8()
+        } else {
+            work.join("reference")
+        };
+        if scenario == "prepare_dir_error" {
+            std::fs::write(&ref_work, b"file").unwrap();
+        }
+        let reference = if scenario == "reference_newline" {
+            "ref\n.mkv"
+        } else {
+            "ref.mkv"
+        };
+        let prepared = c.prepare_reference(reference, &ref_work).await;
+        let expected_prepare_error = match scenario {
+            "probe_failure" => Some("probe failed"),
+            "probe_stderr" => Some("could not cleanly read"),
+            "probe_bad_json" => Some("ffprobe JSON"),
+            "reference_newline" => Some("cannot contain newlines"),
+            "prepare_dir_error" => Some("create metric work directory"),
+            "prepare_color_error" => Some("HDR/wide-gamut"),
+            "retime_ref_fail" => Some("retime failed"),
+            "retime_ref_bad_frames" => Some("frame count mismatch"),
+            "prepare_non_utf8" => Some("must be UTF-8"),
+            _ => None,
+        };
+        if let Some(message) = expected_prepare_error {
+            let error = prepared.unwrap_err();
+            assert!(error.contains(message), "{scenario}: {error}");
+            return;
+        }
+        let prepared = prepared.unwrap();
+        if scenario == "unprepared_cvvdp" {
+            c.kind = MetricKind::Cvvdp;
+        }
+        if scenario == "unprepared_butter" {
+            c.kind = MetricKind::Butteraugli;
+        }
+        let eval_work = if scenario == "cvvdp_trial_non_utf8" {
+            non_utf8()
+        } else {
+            work.join("evaluation")
+        };
+        if scenario == "evaluate_workdir_error" {
+            std::fs::write(&eval_work, b"file").unwrap();
+        }
+        if matches!(
+            scenario,
+            "stale_result_remove_error"
+                | "cvvdp_success"
+                | "cvvdp_missing_result"
+                | "butter_write_error"
+        ) {
+            std::fs::create_dir_all(&eval_work).unwrap();
+            if scenario == "stale_result_remove_error" {
+                std::fs::create_dir(eval_work.join("cvvdp-result.csv")).unwrap();
+            } else if scenario == "butter_write_error" {
+                std::fs::create_dir(eval_work.join("butteraugli-reference.png")).unwrap();
+            } else {
+                std::fs::write(eval_work.join("cvvdp-result.csv"), b"stale result").unwrap();
+            }
+        }
+        let trial = if scenario == "trial_newline" {
+            "trial\n.mkv"
+        } else {
+            "trial.mkv"
+        };
+        let result = c.evaluate(&prepared, trial, &eval_work).await;
+        let expected_error = match scenario {
+            "vmaf_failure" => Some("vmaf failed"),
+            "vmaf_invalid" => Some("non-finite score"),
+            "dimension_mismatch" => Some("dimension mismatch"),
+            "frame_mismatch" => Some("frame count mismatch"),
+            "evaluate_workdir_error" => Some("create metric work directory"),
+            "unprepared_cvvdp" => Some("reference was not prepared for CVVDP"),
+            "unprepared_butter" => Some("reference was not prepared for Butteraugli"),
+            "trial_newline" => Some("cannot contain newlines"),
+            "stale_result_remove_error" => Some("remove stale CVVDP result"),
+            "retime_trial_fail" => Some("retime failed"),
+            "retime_trial_bad_frames" => Some("frame count mismatch"),
+            "retimed_fps_mismatch" => Some("different frame rates after retiming"),
+            "cvvdp_trial_non_utf8" => Some("must be UTF-8"),
+            "cvvdp_failure" => Some("cvvdp failed"),
+            "cvvdp_gpu_fallback" => Some("could not use requested GPU 2"),
+            "cvvdp_missing_result" => Some("did not produce readable"),
+            "cvvdp_bad_result" => Some("non-finite score"),
+            "butter_color_invalid" => Some("HDR/wide-gamut"),
+            "butter_failed" => Some("butter failed"),
+            "butter_score_error" => Some("non-finite score"),
+            "butter_too_many" => Some("decoded more frames"),
+            "butter_too_few" => Some("evaluated 2 frames, expected 3"),
+            "butter_stream_mismatch" => Some("different frame counts"),
+            "butter_stream_invalid" => Some("truncated PNG signature"),
+            "butter_decoder_failure" => Some("decoder broke"),
+            "butter_write_error" => Some("write Butteraugli frame pair"),
+            _ => None,
+        };
+        if let Some(message) = expected_error {
+            let error = result.unwrap_err();
+            assert!(error.contains(message), "{scenario}: {error}");
+        } else {
+            let expected = match scenario {
+                "vmaf_success" => 94.5,
+                "cvvdp_success" => 8.75,
+                // The mock returns frame distances 1, 2 and 3.
+                "butter_success" => 2.0,
+                _ => panic!("unknown scenario: {scenario}"),
+            };
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    fn smoke_dir(name: &str) -> std::path::PathBuf {
+        let variant = TEST_METRIC_ENV
+            .try_with(|(_, scenario)| scenario.clone())
+            .unwrap_or_else(|_| "real".into());
+        std::env::temp_dir().join(format!("sav1n-{name}-{}-{variant}", std::process::id()))
+    }
+
     #[tokio::test]
     #[ignore = "requires real FFmpeg and ffprobe with FFV1 and lavfi"]
     async fn real_lossless_retime_smoke() {
-        let dir =
-            Path::new("/tmp/opencode").join(format!("sav1n-retime-smoke-{}", std::process::id()));
+        lossless_retime_smoke().await;
+    }
+
+    async fn lossless_retime_smoke() {
+        let dir = smoke_dir("retime-smoke");
         tokio::fs::create_dir(&dir).await.unwrap();
         let source = dir.join("source.mkv");
         let output = dir.join("retimed.mkv");
@@ -1231,6 +1882,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                 );
             }
+            assert_eq!(hashes[0].len(), 3);
             assert_eq!(hashes[0], hashes[1]);
         }
         tokio::fs::remove_dir_all(&dir).await.unwrap();
@@ -1330,11 +1982,7 @@ mod tests {
 
     /// Run e.g. `cargo test real_vmaf_smoke -- --ignored --nocapture`.
     async fn real_metric_smoke(kind: MetricKind) {
-        let dir = Path::new("/tmp/opencode").join(format!(
-            "sav1n-metric-smoke-{}-{}",
-            std::process::id(),
-            kind.name()
-        ));
+        let dir = smoke_dir(&format!("metric-smoke-{}", kind.name()));
         tokio::fs::create_dir(&dir).await.unwrap();
         let reference = dir.join("ref.mkv");
         let degraded = dir.join("degraded.mkv");
