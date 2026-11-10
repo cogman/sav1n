@@ -931,13 +931,16 @@ async fn butteraugli(
 ) -> Result<f64, String> {
     let mut reference = PngStream::start(reference, ref_color)?;
     let mut distorted = PngStream::start(distorted, test_color)?;
-    let ref_png = work_dir.join("butteraugli-reference.png");
-    let test_png = work_dir.join("butteraugli-distorted.png");
     let mut mean = MeanDistance::default();
     let scoring = async {
         let mut next = read_pair(&mut reference.stdout, &mut distorted.stdout, info).await?;
         let mut decoded = 0u64;
         while let Some((r, d)) = next {
+            // Never reuse a filename for different frame pixels. Besides making
+            // the scorer's inputs identifiable, this avoids stale image-viewer
+            // caches and mixed-frame snapshots of two independently updated files.
+            let ref_png = work_dir.join(format!("butteraugli-{decoded:06}-reference.png"));
+            let test_png = work_dir.join(format!("butteraugli-{decoded:06}-distorted.png"));
             decoded += 1;
             if decoded > info.frames {
                 return Err("Butteraugli decoded more frames than the preflight count; refusing partial score".into());
@@ -954,10 +957,14 @@ async fn butteraugli(
                 run(command, "libjxl butteraugli_main (requires PNG support)"),
                 read_pair(&mut reference.stdout, &mut distorted.stdout, info),
             );
-            let output = output?;
+            let output = output.map_err(|e| format!("Butteraugli frame {}: {e}", decoded - 1))?;
             let distance = parse_butteraugli(&String::from_utf8_lossy(&output.stdout))
-                .map_err(|e| format!("{e}; {}", diagnostics(&output)))?;
+                .map_err(|e| format!("Butteraugli frame {}: {e}; {}", decoded - 1, diagnostics(&output)))?;
             mean.push(distance)?;
+            // Keep disk use bounded, but only remove inputs after the scorer
+            // has exited; failed pairs remain until the caller cleans up.
+            tokio::try_join!(tokio::fs::remove_file(&ref_png), tokio::fs::remove_file(&test_png))
+                .map_err(|e| format!("remove Butteraugli frame pair: {e}"))?;
             next = following?;
         }
         Ok::<(), String>(())
@@ -1757,7 +1764,7 @@ printf '%s\n3-norm: 0.5\n' "$score"
             if scenario == "stale_result_remove_error" {
                 std::fs::create_dir(eval_work.join("cvvdp-result.csv")).unwrap();
             } else if scenario == "butter_write_error" {
-                std::fs::create_dir(eval_work.join("butteraugli-reference.png")).unwrap();
+                std::fs::create_dir(eval_work.join("butteraugli-000000-reference.png")).unwrap();
             } else {
                 std::fs::write(eval_work.join("cvvdp-result.csv"), b"stale result").unwrap();
             }

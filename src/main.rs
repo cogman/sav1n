@@ -1201,6 +1201,115 @@ struct FrameStats {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires real aomenc, vpxenc, ffprobe, FFmpeg with zscale and butteraugli_main"]
+    async fn real_butteraugli_scene_alignment() {
+        // Use production scene writing, first-pass decoding, trial encoding and
+        // scoring. Lossless encoding makes any frame mismatch unambiguous.
+        struct Lossless(Arc<dyn Encoder + Send + Sync>);
+        impl Encoder for Lossless {
+            fn first_pass(&self, options: EncoderOptions) -> Option<Command> {
+                self.0.first_pass(options)
+            }
+            fn second_pass(&self, options: EncoderOptions) -> Command {
+                let mut command = self.0.second_pass(options);
+                command.args(["--lossless=1", "--aq-mode=0"]);
+                command
+            }
+            fn container_format(&self) -> &'static str {
+                self.0.container_format()
+            }
+            fn max_cq(&self) -> u32 {
+                self.0.max_cq()
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("sav1n-real-alignment-{}", std::process::id()));
+        create_dir(&root).await.unwrap();
+        let dir = root.to_str().unwrap().to_string();
+        let mut input = b"YUV4MPEG2 W64 H48 F24000:1001 C420p10\n".to_vec();
+        // Every adjacent frame differs strongly; 64 frames exceed encoder lag.
+        for number in 0..64u16 {
+            input.extend_from_slice(b"FRAME\n");
+            for y in 0..48u16 {
+                for x in 0..64u16 {
+                    let value = 64 + (number * 193 + x * 7 + y * 11) % 877;
+                    input.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            for _ in 0..64 * 48 / 2 {
+                input.extend_from_slice(&512u16.to_le_bytes());
+            }
+        }
+        let mut reader = std::io::Cursor::new(input);
+        let header = VideoHeader::read(&mut reader).await.unwrap();
+        let buffer = FrameBuffer::new(65, header.clone());
+        for _ in 0..64 {
+            assert_eq!(buffer.read_in_frame(&mut reader).await.unwrap(), Processing);
+        }
+        let header = Arc::new(header);
+        // The second scene is deliberately shifted by one frame, with equal count.
+        for scene in 0..2 {
+            let mut writer = create_scene_file(&dir, scene, header.clone()).await;
+            for number in 0..64 {
+                let frame = buffer
+                    .get_frame((number + scene as u64) % 64)
+                    .await
+                    .unwrap();
+                writer = write_scene_frame(writer, frame).await;
+            }
+            writer.close().wait().await;
+        }
+        let metric = Arc::new(MetricConfig {
+            kind: MetricKind::Butteraugli,
+            target: 1.0,
+            tolerance: 0.1,
+            display: "standard_fhd".into(),
+            device: "cpu".into(),
+        });
+        let reference = Arc::new(prepare_reference(0, &dir, &metric).await);
+        for encoder in [
+            Arc::new(Av1Encoder {}) as Arc<dyn Encoder + Send + Sync>,
+            Arc::new(Vp9Encoder {}),
+        ] {
+            let encoder: Arc<dyn Encoder + Send + Sync> = Arc::new(Lossless(encoder));
+            first_pass(0, dir.clone(), encoder.clone())
+                .await
+                .unwrap()
+                .wait()
+                .await;
+            let score = evaluate_trial(
+                0,
+                0,
+                6,
+                1,
+                dir.clone(),
+                encoder,
+                metric.clone(),
+                reference.clone(),
+            )
+            .await;
+            // Allow tiny reconstruction/conversion differences, not temporal
+            // mismatches (the shifted control scores orders of magnitude higher).
+            eprintln!("lossless alignment distance: {}", -score);
+            assert!(
+                score.abs() < 0.01,
+                "lossless frames are misaligned: {score}"
+            );
+        }
+        let shifted = metric
+            .evaluate(
+                &reference,
+                root.join("000001.mkv").to_str().unwrap(),
+                &root.join("shifted"),
+            )
+            .await
+            .unwrap();
+        eprintln!("one-frame shift distance: {shifted}");
+        assert!(shifted > 1.0, "one-frame shift was not detected: {shifted}");
+        remove_dir_all(&root).await.unwrap();
+    }
+
     #[cfg(unix)]
     mod mock_pipeline {
         use super::*;
@@ -1314,6 +1423,185 @@ printf '1.25\n3-norm: 0.5\n'
                 .scope(
                     environment.clone(),
                     metric::TEST_METRIC_ENV.scope(environment, exercise_pipeline(root.0.clone())),
+                )
+                .await;
+        }
+
+        // Sentinel PNGs let the mock scorer inspect each frame's identity and
+        // argument order. read_png validates their framing/IHDR; they are not
+        // intended to be decoded by a real PNG implementation.
+        fn sentinel_png(label: &str) -> Vec<u8> {
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&2u32.to_be_bytes());
+            png.extend_from_slice(&2u32.to_be_bytes());
+            png.extend_from_slice(&[16, 2, 0, 0, 0]);
+            png.extend_from_slice(&[0; 4]);
+            png.extend_from_slice(&(label.len() as u32).to_be_bytes());
+            png.extend_from_slice(b"tEXt");
+            png.extend_from_slice(label.as_bytes());
+            png.extend_from_slice(&[0; 4]);
+            png.extend_from_slice(&0u32.to_be_bytes());
+            png.extend_from_slice(b"IEND");
+            png.extend_from_slice(&[0; 4]);
+            png
+        }
+
+        #[tokio::test]
+        async fn butteraugli_receives_processed_scene_and_encoded_frames_in_order() {
+            let root = TestDir(
+                std::env::temp_dir()
+                    .join(format!("sav1n butter frame routing {}", std::process::id())),
+            );
+            std::fs::create_dir(&root.0).unwrap();
+            let dir = root.0.to_str().unwrap().to_string();
+
+            // The stand-in for vspipe emits three distinct processed 2x2 C420
+            // frames. The original is deliberately different from all of them.
+            let header = b"YUV4MPEG2 W2 H2 F24:1 C420\n";
+            let y4m = |frames: [&[u8; 6]; 3]| {
+                let mut bytes = header.to_vec();
+                for frame in frames {
+                    bytes.extend_from_slice(b"FRAME\n");
+                    bytes.extend_from_slice(frame);
+                }
+                bytes
+            };
+            let processed = y4m([b"ABCDEF", b"GHIJKL", b"MNOPQR"]);
+            let encoded = y4m([b"abcdef", b"ghijkl", b"mnopqr"]);
+            std::fs::write(root.0.join("original.y4m"), y4m([b"123456"; 3])).unwrap();
+            std::fs::write(root.0.join("processed.y4m"), &processed).unwrap();
+            std::fs::write(root.0.join("encoded.y4m"), &encoded).unwrap();
+            for role in ["reference", "trial"] {
+                for frame in 0..3 {
+                    std::fs::write(
+                        root.0.join(format!("{role}-{frame}.png")),
+                        sentinel_png(&format!("{role}-{frame}")),
+                    )
+                    .unwrap();
+                }
+            }
+
+            executable(
+                &root.0,
+                "ffprobe",
+                r##"#!/bin/sh
+for last do :; done
+case "$last" in
+  "$MOCK_SCENARIO/000007.mkv") /bin/cmp -s "$last" "$MOCK_SCENARIO/processed.y4m" || exit 11 ;;
+  "$MOCK_SCENARIO/000007.probe-30/trial.ivf") /bin/cmp -s "$last" "$MOCK_SCENARIO/encoded.y4m" || exit 12 ;;
+  *) printf 'unexpected probe input: %s\n' "$last" >&2; exit 13 ;;
+esac
+printf '%s\n' '{"streams":[{"width":2,"height":2,"nb_read_frames":"3","nb_read_packets":"3","avg_frame_rate":"24/1","pix_fmt":"yuv420p","color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"}]}'
+"##,
+            );
+            executable(
+                &root.0,
+                "ffmpeg",
+                r##"#!/bin/sh
+prev= input= last= png=0
+for arg do
+  if [ "$prev" = -i ]; then input=$arg; fi
+  if [ "$arg" = image2pipe ]; then png=1; fi
+  prev=$arg; last=$arg
+done
+if [ "$png" = 1 ]; then
+  case "$input" in
+    "$MOCK_SCENARIO/000007.mkv")
+      /bin/cmp -s "$input" "$MOCK_SCENARIO/processed.y4m" || exit 21
+      role=reference ;;
+    "$MOCK_SCENARIO/000007.probe-30/trial.ivf")
+      /bin/cmp -s "$input" "$MOCK_SCENARIO/encoded.y4m" || exit 22
+      role=trial ;;
+    *) printf 'unexpected PNG decoder input: %s\n' "$input" >&2; exit 23 ;;
+  esac
+  /bin/cat "$MOCK_SCENARIO/$role-0.png" "$MOCK_SCENARIO/$role-1.png" "$MOCK_SCENARIO/$role-2.png"
+elif [ "$input" = pipe:0 ]; then
+  [ "$last" = "$MOCK_SCENARIO/000007.mkv" ] || exit 24
+  /bin/cat > "$last"
+else
+  [ "$input" = "$MOCK_SCENARIO/000007.mkv" ] || exit 25
+  /bin/cat "$input"
+fi
+"##,
+            );
+            executable(
+                &root.0,
+                "mock-encoder",
+                r##"#!/bin/sh
+[ "$1" = second ] && [ "$2" = 30 ] || exit 31
+[ "$5" = "$MOCK_SCENARIO/000007.probe-30/trial.ivf" ] || exit 32
+/bin/cat > "$MOCK_SCENARIO/encoder-input.y4m"
+/bin/cmp -s "$MOCK_SCENARIO/encoder-input.y4m" "$MOCK_SCENARIO/processed.y4m" || exit 33
+/bin/sed 's/ABCDEF/abcdef/;s/GHIJKL/ghijkl/;s/MNOPQR/mnopqr/' "$MOCK_SCENARIO/encoder-input.y4m" > "$5"
+"##,
+            );
+            executable(
+                &root.0,
+                "butteraugli_main",
+                r##"#!/bin/sh
+[ "$#" = 4 ] && [ "$3" = --colorspace ] && [ "$4" = RGB_D65_SRG_Rel_SRG ] || exit 41
+count=0
+[ ! -f "$MOCK_SCENARIO/scored" ] || read -r count < "$MOCK_SCENARIO/scored"
+[ "$count" -lt 3 ] || exit 42
+index=$(printf '%06d' "$count")
+[ "${1##*/}" = "butteraugli-$index-reference.png" ] || exit 45
+[ "${2##*/}" = "butteraugli-$index-distorted.png" ] || exit 46
+/bin/cmp -s "$1" "$MOCK_SCENARIO/reference-$count.png" || { printf 'wrong reference frame %s\n' "$count" >&2; exit 43; }
+/bin/cmp -s "$2" "$MOCK_SCENARIO/trial-$count.png" || { printf 'wrong trial frame %s\n' "$count" >&2; exit 44; }
+count=$((count + 1))
+printf '%s\n' "$count" > "$MOCK_SCENARIO/scored"
+printf '%s\n' "$count"
+"##,
+            );
+
+            let environment = (root.0.clone(), dir.clone());
+            TEST_PIPELINE_ENV
+                .scope(
+                    environment.clone(),
+                    metric::TEST_METRIC_ENV.scope(environment, async {
+                        // Exercise the same Y4M reader, frame buffer and FFV1
+                        // scene writer used for vspipe output by the pipeline.
+                        let mut reader = std::io::Cursor::new(processed);
+                        let header = VideoHeader::read(&mut reader).await.unwrap();
+                        let buffer = FrameBuffer::new(4, header.clone());
+                        for _ in 0..3 {
+                            assert_eq!(
+                                buffer.read_in_frame(&mut reader).await.unwrap(),
+                                Processing
+                            );
+                        }
+                        assert_eq!(
+                            buffer.read_in_frame(&mut reader).await.unwrap(),
+                            frame::Status::Completed
+                        );
+                        let mut writer = create_scene_file(&dir, 7, Arc::new(header)).await;
+                        for number in 0..3 {
+                            let frame = buffer.get_frame(number).await.unwrap();
+                            writer = write_scene_frame(writer, frame).await;
+                            buffer.pop().await;
+                        }
+                        writer.close().wait().await;
+
+                        let butter = metric(MetricKind::Butteraugli);
+                        let reference = Arc::new(prepare_reference(7, &dir, &butter).await);
+                        let encoder: Arc<dyn Encoder + Send + Sync> = Arc::new(MockEncoder {
+                            first_pass: false,
+                            fail: false,
+                        });
+                        let score =
+                            evaluate_trial(7, 30, 3, 2, dir.clone(), encoder, butter, reference)
+                                .await;
+                        // The mock returns 1, 2, 3, so the native mean is 2;
+                        // Butteraugli search scores are negated.
+                        assert_eq!(score, -2.0);
+                        assert_eq!(
+                            std::fs::read_to_string(root.0.join("scored")).unwrap(),
+                            "3\n"
+                        );
+                        assert!(!root.0.join("000007.probe-30").exists());
+                    }),
                 )
                 .await;
         }
