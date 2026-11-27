@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3 \
     xxhash
 
-FROM rust:slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS rustbuild
+FROM rust:slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS rustbuild
 WORKDIR /sav1n
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
